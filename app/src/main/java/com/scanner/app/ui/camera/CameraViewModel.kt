@@ -226,19 +226,6 @@ class CameraViewModel : ViewModel() {
                     }
                 }
 
-                // Resolve highlight-recovery EV index (target ≈ -2 EV, clamped to sensor range)
-                val exposureState = info?.exposureState
-                val minIndex = exposureState?.exposureCompensationRange?.lower ?: 0
-                val step = exposureState?.exposureCompensationStep?.let {
-                    if (it.denominator != 0) it.numerator.toFloat() / it.denominator.toFloat() else 1.0f
-                } ?: 1.0f
-                // Deep underexposure for extreme highlight recovery (SPEC_17 §2: -4.5 EV or physical minIndex)
-                val targetHighlightIndex = if (step > 0f) {
-                    kotlin.math.round(-4.5f / step).toInt().coerceIn(minIndex, 0)
-                } else {
-                    minIndex.coerceAtMost(0)
-                }
-
                 val tempFiles = mutableListOf<File>()
 
                 // Frame 0: EV 0 — base frame
@@ -247,21 +234,50 @@ class CameraViewModel : ViewModel() {
                     tempFiles.add(file0)
                 }
 
-                // Frame 1: EV targetHighlightIndex — highlight recovery
-                if (targetHighlightIndex < 0 && control != null) {
-                    setExposureIndex(control, context, targetHighlightIndex)
-                    delay(150)
+                // Inspect Frame 0 exposure parameters from EXIF
+                val baseIso: Int
+                val baseExpSec: Double
+                if (file0.exists()) {
+                    val ex0 = ExifInterface(file0.absolutePath)
+                    baseIso = ex0.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, 800).coerceAtLeast(100)
+                    baseExpSec = parseExposureTime(ex0.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)) ?: 0.033
+                } else {
+                    baseIso = 800
+                    baseExpSec = 0.033
+                }
+
+                // Direct hardware manual exposure for highlight recovery (SPEC_17 §2.1)
+                // In dark scenes (baseIso >= 800 or baseExpSec >= 0.030s), a desk lamp or bright bulb
+                // requires 1/500s @ ISO 100 to completely un-saturate and reveal all surface details.
+                val targetIso = 100
+                val targetExpNanos: Long = if (baseIso >= 800 || baseExpSec >= 0.030) {
+                    2_000_000L // 1/500s
+                } else {
+                    val expSec = (baseExpSec / 16.0).coerceIn(1.0 / 8000.0, 1.0 / 500.0)
+                    (expSec * 1_000_000_000.0).toLong().coerceIn(125_000L, 2_000_000L)
+                }
+                android.util.Log.i(
+                    "HachiCam-Burst",
+                    "Base Frame 0: ISO=$baseIso, Exp=${baseExpSec}s. Target Frame 1 manual: ISO=$targetIso, ExpNanos=$targetExpNanos (${1_000_000_000.0 / targetExpNanos}s)"
+                )
+
+                // Frame 1: Manual Highlight Recovery (CONTROL_AE_MODE_OFF)
+                if (control != null) {
+                    setManualCaptureOptions(control, context, targetExpNanos, targetIso)
+                    delay(100) // Allow 2 sensor VSYNC frames (~66-100ms) for sensor analog gain and rolling shutter to latch
                 }
                 val file1 = File(context.cacheDir, "hdr_${UUID.randomUUID()}_1.jpg")
                 if (takeSinglePicture(capture, context, file1) && file1.exists() && file1.length() > 0) {
                     tempFiles.add(file1)
                 }
 
-                // Frame 2: EV 0 — sub-pixel aux 1 (restore AE before firing)
-                if (targetHighlightIndex < 0 && control != null) {
-                    setExposureIndex(control, context, 0)
-                    delay(150)
+                // Restore Auto-Exposure (CONTROL_AE_MODE_ON) before capturing aux frames
+                if (control != null) {
+                    clearManualCaptureOptions(control, context)
+                    delay(100) // Allow AE to re-engage for normal exposure on aux frames
                 }
+
+                // Frame 2: EV 0 — sub-pixel aux 1
                 val file2 = File(context.cacheDir, "hdr_${UUID.randomUUID()}_2.jpg")
                 if (takeSinglePicture(capture, context, file2) && file2.exists() && file2.length() > 0) {
                     tempFiles.add(file2)
@@ -344,7 +360,9 @@ class CameraViewModel : ViewModel() {
                 e.printStackTrace()
                 _isCapturing.value = false
             } finally {
-                control?.setExposureCompensationIndex(0)
+                control?.let { ctrl ->
+                    clearManualCaptureOptions(ctrl, context)
+                }
             }
         }
     }
@@ -352,6 +370,73 @@ class CameraViewModel : ViewModel() {
     // ─────────────────────────────────────────────
     // Helpers
     // ─────────────────────────────────────────────
+
+    private fun parseExposureTime(expStr: String?): Double? {
+        if (expStr.isNullOrBlank()) return null
+        return try {
+            if (expStr.contains("/")) {
+                val parts = expStr.split("/")
+                val num = parts[0].trim().toDouble()
+                val den = parts[1].trim().toDouble()
+                if (den > 0.0) num / den else null
+            } else {
+                expStr.trim().toDoubleOrNull()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    private suspend fun setManualCaptureOptions(
+        control: CameraControl,
+        context: Context,
+        exposureTimeNanos: Long,
+        iso: Int
+    ): Boolean = suspendCancellableCoroutine { continuation ->
+        try {
+            val camera2Control = androidx.camera.camera2.interop.Camera2CameraControl.from(control)
+            val options = androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE, android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE_OFF)
+                .setCaptureRequestOption(android.hardware.camera2.CaptureRequest.SENSOR_EXPOSURE_TIME, exposureTimeNanos)
+                .setCaptureRequestOption(android.hardware.camera2.CaptureRequest.SENSOR_SENSITIVITY, iso)
+                .build()
+            val future = camera2Control.setCaptureRequestOptions(options)
+            val executor = ContextCompat.getMainExecutor(context)
+            future.addListener({
+                try {
+                    future.get()
+                    if (continuation.isActive) continuation.resume(true)
+                } catch (e: Exception) {
+                    if (continuation.isActive) continuation.resume(false)
+                }
+            }, executor)
+        } catch (e: Exception) {
+            if (continuation.isActive) continuation.resume(false)
+        }
+    }
+
+    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    private suspend fun clearManualCaptureOptions(
+        control: CameraControl,
+        context: Context
+    ): Boolean = suspendCancellableCoroutine { continuation ->
+        try {
+            val camera2Control = androidx.camera.camera2.interop.Camera2CameraControl.from(control)
+            val future = camera2Control.clearCaptureRequestOptions()
+            val executor = ContextCompat.getMainExecutor(context)
+            future.addListener({
+                try {
+                    future.get()
+                    if (continuation.isActive) continuation.resume(true)
+                } catch (e: Exception) {
+                    if (continuation.isActive) continuation.resume(false)
+                }
+            }, executor)
+        } catch (e: Exception) {
+            if (continuation.isActive) continuation.resume(false)
+        }
+    }
 
     /**
      * Read EXIF orientation from [refFile], rotate [fusedMat] using OpenCV SIMD rotate,
@@ -392,27 +477,6 @@ class CameraViewModel : ViewModel() {
         saveParams.release()
         uprightMat.release()
         ExifUtils.copyAndStampExif(refFile, outFile, mode = mode)
-    }
-
-    private suspend fun setExposureIndex(
-        control: CameraControl,
-        context: Context,
-        index: Int
-    ): Int = suspendCancellableCoroutine { continuation ->
-        try {
-            val future = control.setExposureCompensationIndex(index)
-            val executor = ContextCompat.getMainExecutor(context)
-            future.addListener({
-                try {
-                    val result = future.get()
-                    if (continuation.isActive) continuation.resume(result)
-                } catch (e: Exception) {
-                    if (continuation.isActive) continuation.resume(index)
-                }
-            }, executor)
-        } catch (e: Exception) {
-            if (continuation.isActive) continuation.resume(index)
-        }
     }
 
     private suspend fun takeSinglePicture(

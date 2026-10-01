@@ -44,14 +44,21 @@
 
 ## 2. 曝光控制契约规范 (Camera2 Exposure Contract)
 
-为了向 Vulkan 管线提供真正包含完整高光纹理的原始像素，连拍帧序列必须实施**强制手动快门策略（Manual Shutter Override）**：
+为了向 Vulkan 管线提供真正包含完整高光纹理的原始像素，连拍帧序列必须实施**底层硬件强制手动快门策略（Manual Shutter Override）**，绝不依赖 CameraX AE 曝光补偿（后者在暗场景受 3A 收敛滤波和测光限制，无法瞬间下潜至高光曝光）：
 
 | 帧序号 | 曝光模式 | 快门速度 (`SENSOR_EXPOSURE_TIME`) | ISO (`SENSOR_SENSITIVITY`) | 用途 |
 |:---:|:---:|:---:|:---:|:---|
-| **Frame 0** | 自动曝光 (AE) | 传感器自动（如 1/17s） | 传感器自动（如 4000） | 空间几何与暗部信噪比基准帧 |
-| **Frame 1** | **全手动 (Manual)** | **强制 1/1000s ~ 1/2000s** | **强制锁定 100 ~ 200** | **极限高光帧：确保台灯灯罩、夜灯发光面退出 255 饱和区** |
-| **Frame 2** | 自动曝光 (AE) | 传感器自动（恢复基准） | 传感器自动 | 亚像素位移重构辅助帧 1 |
-| **Frame 3** | 自动曝光 (AE) | 传感器自动（恢复基准） | 传感器自动 | 亚像素位移重构辅助帧 2 |
+| **Frame 0** | 自动曝光 (AE) | 传感器自动测光（如 1/30s） | 传感器自动（如 5104） | 空间几何与暗部信噪比基准帧 |
+| **Frame 1** | **全手动 (`CONTROL_AE_MODE_OFF`)** | **极暗场景强制 1/500s (2ms) / 亮场景 1/8000s~1/500s** | **强制锁定 100 (Base ISO)** | **极限高光帧：确保台灯灯罩、夜灯发光面彻底退出 255 饱和区** |
+| **Frame 2** | 自动曝光 (AE) | 传感器自动（恢复基准） | 传感器自动 | 亚像素位移重构辅助帧 1 (降噪) |
+| **Frame 3** | 自动曝光 (AE) | 传感器自动（恢复基准） | 传感器自动 | 亚像素位移重构辅助帧 2 (超分) |
+
+### 2.1 Camera2 手动曝光注入时序 (Hardware Injection Sequence)
+1. **Frame 0 拍摄完成**：从其 EXIF 立即读取 `baseIso` 与 `baseExpSec`，评估环境大光比级别；
+2. **注入 Manual CaptureRequest**：调用 `Camera2CameraControl.setCaptureRequestOptions`，配置 `CONTROL_AE_MODE = OFF`, `SENSOR_SENSITIVITY = 100`, `SENSOR_EXPOSURE_TIME = 2,000,000L`；
+3. **传感器 VSYNC 锁相延迟**：延迟 100ms（等待 2 个传感器帧），使 CMOS 模拟增益寄存器与卷帘快门曝光时间完成物理生效；
+4. **Frame 1 捕获**：拍摄超低曝光帧，确保极端发光体在原始图像中落在 $[50, 200]$ 优质区间；
+5. **恢复 AE 模式**：调用 `clearCaptureRequestOptions()` 并延迟 100ms，让 3A 重新接管，为 Frame 2/3 拍摄提供充足环境光照。
 
 ---
 
@@ -63,32 +70,34 @@
   $$\begin{pmatrix} x' \\ y' \\ 1 \end{pmatrix} = H_{2\times}^{-1} \begin{pmatrix} X_{\text{50M}} \\ Y_{\text{50M}} \\ 1 \end{pmatrix}$$
 - **双三次插值（Bicubic Kernel）**：
   采用 Catmull-Rom 样条基函数对 16 个临近样本进行 GPU 硬件纹理加速采样，最大限度恢复超越单帧奈奎斯特极限的高频光学微纹理；
-- **时域高斯权重计算**：
-  $$W_i = \exp\left(-\frac{\|I_i(x', y') - I_0(x, y)\|^2}{2 \sigma_{\text{color}}^2}\right)$$
-  在 GPU 局部寄存器中直接计算，彻底告别 CPU 查表。
+- **高光排除累加**：
+  在多帧超分融合时，基准帧亮度 $Y_0 \ge 180$ 的区域停止累加辅帧，防止过曝白斑稀释 Frame 1 捕获的高光纹理。
 
-### 3.2 阶段二：极限高光 Hermite 融合 (`highlight_graft_hdr.comp`)
-针对 Frame 1（极短曝光帧），其亮度缩放倍率增益为：
-$$\text{Gain} = \frac{T_0 \cdot \text{ISO}_0}{T_1 \cdot \text{ISO}_1}$$
-对于基准图亮度 $Y_0 \ge 215$ 的区域，应用三次 Hermite 平滑混合阶梯：
-$$t = \text{clamp}\left(\frac{Y_0 - 215.0}{245.0 - 215.0}, 0.0, 1.0\right)$$
-$$\alpha = t^2 (3.0 - 2.0 t)$$
-$$C_{\text{final}} = (1.0 - \alpha) \cdot C_{\text{accum}} + \alpha \cdot \text{clamp}(C_{\text{short}} \cdot \text{Gain}, 0, 255)$$
-将台灯灯罩内部的物理轮廓精准嫁接回 50MP 画布，边缘完全无缝。
+### 3.2 阶段二：色调映射高光平滑重建 (`vulkan_hdr_ltm.comp` Pass 1)
+针对短曝光帧（Frame 1），禁止直接乘以物理曝光比（否则将再次溢出至 255 死白）。采用保色非线性高光映射曲线：
+- **亮度目标映射（Tone-Mapped Target Luminance）**：
+  $$Y_{\text{graft}} = 175.0 + 70.0 \cdot \left(\frac{Y_{\text{short}}}{255.0}\right)^{0.75}$$
+  严格保证映射输出在 $[175.0, 245.0]$ 范围之内，保留柔和层次，永不饱和；
+- **色度等比缩放**：
+  $$C_{\text{graft}} = C_{\text{short}} \cdot \frac{Y_{\text{graft}}}{\max(Y_{\text{short}}, 0.001)}$$
+  色度比率（R:G:B）取自 Frame 1，完美还原发光体原本物理色温（如暖黄光或冷白光）；
+- **三次 Hermite 平滑混合**：
+  对于基准图亮度 $Y_0 \in [180.0, 235.0]$：
+  $$t = \text{clamp}\left(\frac{Y_0 - 180.0}{235.0 - 180.0}, 0.0, 1.0\right), \quad \alpha = t^2 (3.0 - 2.0 t)$$
+  $$C_{\text{final}} = (1.0 - \alpha) \cdot C_{\text{base}} + \alpha \cdot C_{\text{graft}}$$
+  在边缘实现微观光子连续过渡，杜绝黑圈或硬边伪影。
 
-### 3.3 阶段三：基于导向滤波的局部色调映射 (`fast_guided_ltm.comp`)
+### 3.3 阶段三：基于局部色调映射与权重衰减 (Pass 2)
 - **高低频分离**：
-  通过快速导向滤波（Fast Guided Filter）将融合后的高动态图分解为：
-  - **基础层（Base Layer $I_{\text{base}}$）**：全局光照分布；
-  - **细节层（Detail Layer $I_{\text{detail}} = I - I_{\text{base}}$）**：物理表面高频纹理。
+  $3 \times 3$ 滑动窗口分离全局光照底图（Base Layer $I_{\text{base}}$）与表面微反差（Detail Layer $I_{\text{detail}}$）；
 - **大光比对数压缩**：
   $$I_{\text{base\_compressed}} = \frac{\log(1.0 + \mu \cdot I_{\text{base}})}{\log(1.0 + \mu)}$$
-  其中 $\mu = 8.0$。此操作只压缩空间大光比，彻底压制台灯周围发散的光晕（Halo），同时拉起暗部墙面；
-- **细节重合成**：
-  $$I_{\text{LTM}} = I_{\text{base\_compressed}} + \beta \cdot I_{\text{detail}}$$
-  其中 $\beta = 1.15$（微反差轻度增益）。
+  拉升暗部墙面细节，压制空间散射光晕；
+- **高光区域 LTM 渐隐保护**：
+  $$w_{\text{LTM}} = \text{clamp}\left(\frac{220.0 - Y}{40.0}, 0.0, 1.0\right)$$
+  对高光区域（$Y \ge 220$）淡出局部色调映射，避免二次提升导致灯具发散，100% 锁死已重建的高光物理质感。
 
-### 3.4 阶段四：S 曲线黑位收敛 (`s_curve_contrast.comp`)
+### 3.4 阶段四：S 曲线黑位收敛 (Pass 3)
 - **暗部黑电平平滑沉降**：
   针对极暗阴影区（$Y \le 28.0$），执行：
   $$u = \frac{Y}{28.0}, \quad Y_{\text{tone}} = Y \cdot u^{0.65}$$

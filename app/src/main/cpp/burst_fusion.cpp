@@ -85,8 +85,16 @@ bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& 
     }
 
     int inlierCount = cv::countNonZero(inlierMask);
-    if (inlierCount < 20 || static_cast<float>(inlierCount) / goodCount < 0.30f) {
-        LOGW("alignFrameHomography: low inlier ratio (%d / %d)", inlierCount, goodCount);
+    float inlierRatio = (goodCount > 0) ? (static_cast<float>(inlierCount) / static_cast<float>(goodCount)) : 0.0f;
+    if (inlierCount < 15 || inlierRatio < 0.10f) {
+        LOGW("alignFrameHomography: low inlier ratio (%d / %d = %.2f)", inlierCount, goodCount, inlierRatio);
+        return false;
+    }
+
+    // 校验单应性矩阵仿射行列式，杜绝畸变奇异矩阵 (det 应在 1.0 附近)
+    double det = H.at<double>(0,0) * H.at<double>(1,1) - H.at<double>(0,1) * H.at<double>(1,0);
+    if (std::abs(det - 1.0) > 0.40) {
+        LOGW("alignFrameHomography: degenerate homography determinant (%.3f)", det);
         return false;
     }
 
@@ -245,8 +253,8 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
                     int y0 = (29 * b0[0] + 150 * b0[1] + 77 * b0[2]) >> 8;
                     int yk = (29 * bk[0] + 150 * bk[1] + 77 * bk[2]) >> 8;
 
-                    // 高光饱和区：基准帧已过曝（y0 >= 215），严禁继续累加辅帧，防止 255 白斑稀释 Frame 1 细节
-                    if (isScreenMode && y0 >= 215) {
+                    // 高光饱和过渡区：基准帧偏亮（y0 >= 180），严禁累加辅帧，防止过曝白斑稀释 Frame 1 细节
+                    if (isScreenMode && y0 >= 180) {
                         continue;
                     }
 
@@ -302,7 +310,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
 
         // CPU Fallback Path (if Vulkan was not supported or failed)
         if (!vulkanSuccess && isScreenMode && !frame1Super.empty()) {
-            LOGI("Running CPU Hermite highlight graft (gain=%.2f)...", alphaFrame1);
+            LOGI("Running CPU tone-mapped highlight graft (gain=%.2f)...", alphaFrame1);
             #pragma omp parallel for schedule(static)
             for (int y = 0; y < superRows; ++y) {
                 cv::Vec3b* pDst = superResult.ptr<cv::Vec3b>(y);
@@ -310,13 +318,22 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
                 for (int x = 0; x < superCols; ++x) {
                     cv::Vec3b& px = pDst[x];
                     int y0 = (29 * px[0] + 150 * px[1] + 77 * px[2]) >> 8;
-                    if (y0 >= 210) {
-                        float t = std::clamp((y0 - 210.0f) / 35.0f, 0.0f, 1.0f);
+                    if (y0 >= 180) {
+                        float t = std::clamp((y0 - 180.0f) / 55.0f, 0.0f, 1.0f);
                         float m = 3.0f * t * t - 2.0f * t * t * t;
                         const cv::Vec3b& s = pShort[x];
+                        float shortLuma = (29.0f * s[0] + 150.0f * s[1] + 77.0f * s[2]) / 256.0f;
+                        float normShort = std::clamp(shortLuma / 255.0f, 0.0f, 1.0f);
+                        float targetGraftLuma = 175.0f + 70.0f * std::pow(normShort, 0.75f);
                         for (int c = 0; c < 3; ++c) {
                             float v0 = static_cast<float>(px[c]);
-                            float vk = std::clamp(static_cast<float>(s[c]) * alphaFrame1, 0.0f, 255.0f);
+                            float vk;
+                            if (shortLuma > 1.0f) {
+                                float colorScale = targetGraftLuma / shortLuma;
+                                vk = std::clamp(static_cast<float>(s[c]) * colorScale, 0.0f, 255.0f);
+                            } else {
+                                vk = std::clamp(v0 * (175.0f / std::max(static_cast<float>(y0), 1.0f)), 0.0f, 255.0f);
+                            }
                             px[c] = cv::saturate_cast<uchar>((1.0f - m) * v0 + m * vk);
                         }
                     }

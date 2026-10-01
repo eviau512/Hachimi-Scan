@@ -66,14 +66,30 @@ void main() {
     float luma = getLuma(rgb);
 
     // ────────────────────────────────────────────────────────────────────────
-    // 1. Extreme Highlight Grafting (Desk Lamp & Point Source Un-saturation)
+    // 1. Extreme Highlight Tone-Mapped Reconstruction (SPEC_17 §3.1)
     // ────────────────────────────────────────────────────────────────────────
-    if (push.isScreenMode != 0 && luma > 215.0) {
-        float t = clamp((luma - 215.0) / (245.0 - 215.0), 0.0, 1.0);
+    if (push.isScreenMode != 0 && luma > 180.0) {
+        float t = clamp((luma - 180.0) / (235.0 - 180.0), 0.0, 1.0);
         float alpha = t * t * (3.0 - 2.0 * t); // Smooth Hermite step
 
-        vec3 boostedShort = clamp(shortColor.rgb * push.exposureGain, 0.0, 255.0);
-        rgb = mix(rgb, boostedShort, alpha);
+        vec3 shortRgb = shortColor.rgb;
+        float shortLuma = getLuma(shortRgb);
+
+        // Smooth non-clipping highlight target in [175, 245]
+        // Preserves internal bulb filaments, shade gradients, and edge contours without 255 blowout.
+        float normShort = clamp(shortLuma / 255.0, 0.0, 1.0);
+        float targetGraftLuma = 175.0 + 70.0 * pow(normShort, 0.75);
+
+        vec3 graftColor;
+        if (shortLuma > 1.0) {
+            float colorScale = targetGraftLuma / shortLuma;
+            graftColor = clamp(shortRgb * colorScale, 0.0, 255.0);
+        } else {
+            // Background / unilluminated regions in short frame: compress base smoothly
+            graftColor = clamp(rgb * (175.0 / max(luma, 1.0)), 0.0, 255.0);
+        }
+
+        rgb = mix(rgb, graftColor, alpha);
         luma = getLuma(rgb);
     }
 
@@ -106,8 +122,12 @@ void main() {
         float newLuma = clamp(compressedBase + push.ltmBeta * detail, 0.0, 255.0);
 
         float scale = newLuma / max(luma, 0.001);
-        rgb = clamp(rgb * scale, 0.0, 255.0);
-        luma = newLuma;
+        vec3 ltmRgb = clamp(rgb * scale, 0.0, 255.0);
+
+        // LTM applies to shadows and midtones; rolls off in highlights to preserve graft contrast
+        float ltmWeight = clamp((220.0 - luma) / 40.0, 0.0, 1.0);
+        rgb = mix(rgb, ltmRgb, ltmWeight);
+        luma = getLuma(rgb);
     }
 
     // ────────────────────────────────────────────────────────────────────────
