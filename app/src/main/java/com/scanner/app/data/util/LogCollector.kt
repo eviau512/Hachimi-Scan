@@ -89,10 +89,23 @@ object LogCollector {
             sb.appendLine("Memory Usage   : Used: ${usedMem}MB / Total: ${totalMem}MB / Max: ${maxMem}MB")
             sb.appendLine()
 
-            // Logcat Capture (App process logs)
-            sb.appendLine("--- Recent Logcat (Process UID / App Logs) ---")
+            // Logcat Capture (App process + Camera HAL logs via Root if granted)
+            sb.appendLine("--- Recent Logcat (Process UID & Camera HAL Logs) ---")
             try {
-                val process = Runtime.getRuntime().exec("logcat -d -v time -t 2000")
+                val hasSu = try {
+                    val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
+                    p.waitFor() == 0
+                } catch (e: Exception) {
+                    false
+                }
+
+                val process = if (hasSu) {
+                    sb.appendLine("(Root permission detected: capturing system & Qualcomm Camera HAL logs)")
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", "logcat -d -v time -t 4000"))
+                } else {
+                    Runtime.getRuntime().exec("logcat -d -v time -t 2000")
+                }
+
                 BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
                     var line: String?
                     var count = 0

@@ -23,6 +23,8 @@ import com.scanner.app.domain.model.ImageFilter
 import com.scanner.app.domain.model.ScannedPage
 import com.scanner.app.engine.NativeBurstFusion
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -261,14 +263,14 @@ class CameraViewModel : ViewModel() {
                     baseExpSec = 0.033
                 }
 
-                // Tier 2 (-2.5 EV): Midtone Transition
-                val midIso = (baseIso / 3).coerceIn(100, 3200)
-                val midExpSec = (baseExpSec / 2.0).coerceIn(1.0 / 2000.0, 1.0 / 30.0)
+                // Tier 2 (-3.5 EV): Midtone Transition
+                val midIso = (baseIso / 4).coerceIn(100, 3200)
+                val midExpSec = (baseExpSec / 3.0).coerceIn(1.0 / 2000.0, 1.0 / 30.0)
                 val midExpNanos = (midExpSec * 1_000_000_000.0).toLong().coerceIn(500_000L, 33_333_333L)
 
-                // Tier 3 (-5.0 EV): Deep Highlight Recovery (Desk lamp bulb & filaments)
-                val shortIso = 100
-                val shortExpSec = (baseExpSec / 16.0).coerceIn(1.0 / 4000.0, 1.0 / 250.0)
+                // Tier 3 (-7.0 EV): Deep Highlight Recovery (Desk lamp bulb & filaments)
+                val shortIso = (midIso / 8).coerceIn(100, 800)
+                val shortExpSec = (midExpSec / 4.0).coerceIn(1.0 / 4000.0, 1.0 / 250.0)
                 val shortExpNanos = (shortExpSec * 1_000_000_000.0).toLong().coerceIn(250_000L, 4_000_000L)
 
                 android.util.Log.i(
@@ -331,11 +333,12 @@ class CameraViewModel : ViewModel() {
                 val finalPhotoFile = File(context.cacheDir, "${UUID.randomUUID()}.jpg")
 
                 withContext(Dispatchers.IO) {
-                    val mats = mutableListOf<Mat>()
-                    for (file in allFiles) {
-                        val mat = Imgcodecs.imread(file.absolutePath)
-                        if (!mat.empty()) mats.add(mat)
+                    val deferredMats = allFiles.map { file ->
+                        async(Dispatchers.IO) {
+                            Imgcodecs.imread(file.absolutePath)
+                        }
                     }
+                    val mats = deferredMats.awaitAll().filter { !it.empty() }
 
                     if (mats.isNotEmpty()) {
                         val fusionEngine = NativeBurstFusion()

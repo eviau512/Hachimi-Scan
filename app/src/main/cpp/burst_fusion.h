@@ -17,6 +17,9 @@ public:
     // 第一级：全局单应性粗配准 (ORB + RANSAC Homography)
     bool alignFrameHomography(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH);
 
+    // 暗光极高光质心与微细节配准 (Highlight Centroid & Correlation Alignment for dark scenes)
+    bool alignHighlightFrame(const cv::Mat& srcShort, const cv::Mat& refBase, cv::Mat& outWarped, cv::Mat& outH);
+
 private:
     // 计算欠曝帧到基准帧在高光过渡区 (Y0 in [210, 240]) 的平滑亮度自适应增益比
     float estimateHighlightAdaptationGain(const cv::Mat& bgrBase, const cv::Mat& bgrCand, const cv::Mat& validMask);
