@@ -15,14 +15,18 @@ add_library(
         perspective_corrector.cpp
         curve_dewarper.cpp
         burst_fusion.cpp
+        vulkan_compute_engine.cpp
         jni_bridge.cpp
 )
+
+find_library(vulkan-lib vulkan)
 
 target_link_libraries(
         doc_scanner_engine
         log
         jnigraphics
         OpenCV::opencv_java4
+        ${vulkan-lib}
 )
 
 target_compile_options(doc_scanner_engine PRIVATE -O3 -ffast-math -fopenmp)

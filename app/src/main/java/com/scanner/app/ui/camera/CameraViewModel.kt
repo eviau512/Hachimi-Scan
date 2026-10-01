@@ -232,8 +232,9 @@ class CameraViewModel : ViewModel() {
                 val step = exposureState?.exposureCompensationStep?.let {
                     if (it.denominator != 0) it.numerator.toFloat() / it.denominator.toFloat() else 1.0f
                 } ?: 1.0f
+                // Deep underexposure for extreme highlight recovery (SPEC_17 §2: -4.5 EV or physical minIndex)
                 val targetHighlightIndex = if (step > 0f) {
-                    kotlin.math.round(-2.0f / step).toInt().coerceIn(minIndex, 0)
+                    kotlin.math.round(-4.5f / step).toInt().coerceIn(minIndex, 0)
                 } else {
                     minIndex.coerceAtMost(0)
                 }

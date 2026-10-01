@@ -1,0 +1,124 @@
+#version 450
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Binding 0: Base Frame / Accumulation Buffer (RGBA8 packed as uint32)
+layout(std430, binding = 0) readonly buffer InputBaseBuffer {
+    uint inBaseData[];
+};
+
+// Binding 1: Short Exposure Frame (Highlight Recovery Frame, RGBA8 packed)
+layout(std430, binding = 1) readonly buffer InputShortBuffer {
+    uint inShortData[];
+};
+
+// Binding 2: Fused Output Buffer (RGBA8 packed as uint32)
+layout(std430, binding = 2) writeonly buffer OutputBuffer {
+    uint outData[];
+};
+
+layout(push_constant) uniform PushConstants {
+    int width;
+    int height;
+    float exposureGain;
+    float ltmMu;
+    float ltmBeta;
+    float toeThreshold;
+    float toePower;
+    int isScreenMode;
+} push;
+
+vec4 unpackRGBA(uint val) {
+    return vec4(
+        float(val & 0xFFu),
+        float((val >> 8) & 0xFFu),
+        float((val >> 16) & 0xFFu),
+        float((val >> 24) & 0xFFu)
+    );
+}
+
+uint packRGBA(vec4 c) {
+    uint r = uint(clamp(c.r, 0.0, 255.0));
+    uint g = uint(clamp(c.g, 0.0, 255.0));
+    uint b = uint(clamp(c.b, 0.0, 255.0));
+    uint a = 255u;
+    return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+float getLuma(vec3 rgb) {
+    return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+
+    if (x >= push.width || y >= push.height) {
+        return;
+    }
+
+    int idx = y * push.width + x;
+
+    vec4 baseColor = unpackRGBA(inBaseData[idx]);
+    vec4 shortColor = unpackRGBA(inShortData[idx]);
+
+    vec3 rgb = baseColor.rgb;
+    float luma = getLuma(rgb);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 1. Extreme Highlight Grafting (Desk Lamp & Point Source Un-saturation)
+    // ────────────────────────────────────────────────────────────────────────
+    if (push.isScreenMode != 0 && luma > 215.0) {
+        float t = clamp((luma - 215.0) / (245.0 - 215.0), 0.0, 1.0);
+        float alpha = t * t * (3.0 - 2.0 * t); // Smooth Hermite step
+
+        vec3 boostedShort = clamp(shortColor.rgb * push.exposureGain, 0.0, 255.0);
+        rgb = mix(rgb, boostedShort, alpha);
+        luma = getLuma(rgb);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 2. Fast Local Tone Mapping (LTM) - 3x3 Window Base/Detail Separation
+    // ────────────────────────────────────────────────────────────────────────
+    if (push.isScreenMode != 0) {
+        float lumaSum = 0.0;
+        int count = 0;
+
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int nx = clamp(x + dx, 0, push.width - 1);
+                int ny = clamp(y + dy, 0, push.height - 1);
+                int nIdx = ny * push.width + nx;
+                vec3 nRgb = unpackRGBA(inBaseData[nIdx]).rgb;
+                lumaSum += getLuma(nRgb);
+                count++;
+            }
+        }
+
+        float baseLuma = lumaSum / float(count);
+        float detail = luma - baseLuma;
+
+        // Logarithmic compression on base illumination layer (compressing dynamic range)
+        float normBase = clamp(baseLuma / 255.0, 0.0, 1.0);
+        float compressedBase = (log(1.0 + push.ltmMu * normBase) / log(1.0 + push.ltmMu)) * 255.0;
+
+        // Recombine compressed base + preserved high-frequency detail
+        float newLuma = clamp(compressedBase + push.ltmBeta * detail, 0.0, 255.0);
+
+        float scale = newLuma / max(luma, 0.001);
+        rgb = clamp(rgb * scale, 0.0, 255.0);
+        luma = newLuma;
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 3. Cinematic S-Curve Toe Damping (Dark Level Convergence)
+    // ────────────────────────────────────────────────────────────────────────
+    if (push.isScreenMode != 0 && luma <= push.toeThreshold) {
+        float u = luma / push.toeThreshold;
+        float toeLuma = push.toeThreshold * pow(u, push.toePower + 1.0);
+        float toeScale = toeLuma / max(luma, 0.001);
+        rgb = clamp(rgb * toeScale, 0.0, 255.0);
+    }
+
+    outData[idx] = packRGBA(vec4(rgb, 1.0));
+}

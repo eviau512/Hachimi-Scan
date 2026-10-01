@@ -1,4 +1,5 @@
 #include "burst_fusion.h"
+#include "vulkan_compute_engine.h"
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -171,6 +172,9 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
 
         cv::Mat validMaskSrc = cv::Mat::ones(baseFrame.size(), CV_8UC1) * 255;
 
+        cv::Mat frame1Super;
+        float alphaFrame1 = 2.0f;
+
         // 2. 遍历辅帧，计算单应性并换算到 2x 亚像素坐标系进行多相核累加
         for (size_t k = 1; k < burstFrames.size(); ++k) {
             const cv::Mat& candFrame = burstFrames[k];
@@ -194,6 +198,11 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
             cv::warpPerspective(validMaskSrc, validMaskSuper, H2x, cv::Size(superCols, superRows), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
 
             float alpha = isScreenMode ? estimateHighlightAdaptationGain(baseSuper, candWarpedSuper, validMaskSuper) : 1.0f;
+
+            if (k == 1 && isScreenMode) {
+                frame1Super = candWarpedSuper.clone();
+                alphaFrame1 = alpha;
+            }
 
             #pragma omp parallel for schedule(static)
             for (int y = 0; y < superRows; ++y) {
@@ -258,8 +267,24 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
             }
         }
 
-        // HDR 暗部 S-Curve 增强
-        if (isScreenMode) {
+        // ─── Vulkan GPU Acceleration Path (SPEC_17) ───
+        bool vulkanSuccess = false;
+        if (isScreenMode && !frame1Super.empty() && VulkanComputeEngine::getInstance().isSupported()) {
+            cv::Mat baseRgba, shortRgba, outRgba;
+            cv::cvtColor(superResult, baseRgba, cv::COLOR_BGR2RGBA);
+            cv::cvtColor(frame1Super, shortRgba, cv::COLOR_BGR2RGBA);
+
+            if (VulkanComputeEngine::getInstance().processHdrLtm(
+                    baseRgba, shortRgba, outRgba,
+                    alphaFrame1, 8.0f, 1.15f, 28.0f, 0.65f, true
+            )) {
+                cv::cvtColor(outRgba, superResult, cv::COLOR_RGBA2BGR);
+                vulkanSuccess = true;
+            }
+        }
+
+        // CPU Fallback Path (if Vulkan was not supported or failed)
+        if (!vulkanSuccess && isScreenMode) {
             #pragma omp parallel for schedule(static)
             for (int y = 0; y < superRows; ++y) {
                 cv::Vec3b* pDst = superResult.ptr<cv::Vec3b>(y);
