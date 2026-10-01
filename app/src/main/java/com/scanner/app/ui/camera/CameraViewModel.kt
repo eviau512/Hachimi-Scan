@@ -250,7 +250,7 @@ class CameraViewModel : ViewModel() {
                 // Frame 1: EV targetHighlightIndex — highlight recovery
                 if (targetHighlightIndex < 0 && control != null) {
                     setExposureIndex(control, context, targetHighlightIndex)
-                    delay(50)
+                    delay(150)
                 }
                 val file1 = File(context.cacheDir, "hdr_${UUID.randomUUID()}_1.jpg")
                 if (takeSinglePicture(capture, context, file1) && file1.exists() && file1.length() > 0) {
@@ -260,7 +260,7 @@ class CameraViewModel : ViewModel() {
                 // Frame 2: EV 0 — sub-pixel aux 1 (restore AE before firing)
                 if (targetHighlightIndex < 0 && control != null) {
                     setExposureIndex(control, context, 0)
-                    delay(50)
+                    delay(150)
                 }
                 val file2 = File(context.cacheDir, "hdr_${UUID.randomUUID()}_2.jpg")
                 if (takeSinglePicture(capture, context, file2) && file2.exists() && file2.length() > 0) {
@@ -276,6 +276,17 @@ class CameraViewModel : ViewModel() {
                 if (tempFiles.isEmpty()) {
                     _isCapturing.value = false
                     return@launch
+                }
+
+                tempFiles.forEachIndexed { idx, f ->
+                    try {
+                        val ex = androidx.exifinterface.media.ExifInterface(f.absolutePath)
+                        val iso = ex.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
+                        val exp = ex.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME)
+                        android.util.Log.i("HachiCam-Burst", "Burst Frame $idx: ISO=$iso, ExpTime=$exp, size=${f.length()} bytes")
+                    } catch (e: Exception) {
+                        android.util.Log.w("HachiCam-Burst", "Failed to inspect Frame $idx EXIF: ${e.message}")
+                    }
                 }
 
                 val finalPhotoFile = File(context.cacheDir, "${UUID.randomUUID()}.jpg")

@@ -5,8 +5,20 @@
 #include "perspective_corrector.h"
 #include "curve_dewarper.h"
 #include "burst_fusion.h"
+#include "vulkan_compute_engine.h"
+#include <android/log.h>
+
+#define TAG "HachiCam-JNI"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
 extern "C" {
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    LOGI("HachiCam Native Engine loaded! Probing Vulkan GPU compute...");
+    bool vulkanReady = VulkanComputeEngine::getInstance().isSupported();
+    LOGI("Vulkan Compute Engine ready status: %s", vulkanReady ? "YES (Adreno/Vulkan active)" : "NO (CPU fallback)");
+    return JNI_VERSION_1_6;
+}
 
 JNIEXPORT jfloatArray JNICALL
 Java_com_scanner_app_engine_NativeEdgeDetector_nativeDetectDocument(JNIEnv* env, jobject /* this */, jlong matAddr, jboolean curvedMode, jfloat touchX, jfloat touchY) {

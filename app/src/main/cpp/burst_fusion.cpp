@@ -3,6 +3,12 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <android/log.h>
+
+#define LOG_TAG "HachiCam-Fusion"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ============================================================================
 // 第一级：全局单应性粗配准 (ORB + RANSAC Homography)
@@ -41,6 +47,7 @@ bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& 
     orb->detectAndCompute(smallRef, cv::noArray(), kpRef, descRef);
 
     if (descSrc.empty() || descRef.empty() || kpSrc.size() < 15 || kpRef.size() < 15) {
+        LOGW("alignFrameHomography: insufficient keypoints (src=%zu, ref=%zu)", kpSrc.size(), kpRef.size());
         return false;
     }
 
@@ -49,7 +56,10 @@ bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& 
     std::vector<cv::DMatch> matches;
     matcher.match(descSrc, descRef, matches);
 
-    if (matches.size() < 12) return false;
+    if (matches.size() < 12) {
+        LOGW("alignFrameHomography: insufficient matches (%zu)", matches.size());
+        return false;
+    }
 
     std::sort(matches.begin(), matches.end(), [](const cv::DMatch& a, const cv::DMatch& b) {
         return a.distance < b.distance;
@@ -69,10 +79,14 @@ bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& 
     // 4. RANSAC 求解单应性变换矩阵并校验内点率
     cv::Mat inlierMask;
     cv::Mat H = cv::findHomography(ptsSrc, ptsRef, cv::RANSAC, 3.0, inlierMask);
-    if (H.empty()) return false;
+    if (H.empty()) {
+        LOGW("alignFrameHomography: RANSAC homography estimation failed");
+        return false;
+    }
 
     int inlierCount = cv::countNonZero(inlierMask);
     if (inlierCount < 20 || static_cast<float>(inlierCount) / goodCount < 0.30f) {
+        LOGW("alignFrameHomography: low inlier ratio (%d / %d)", inlierCount, goodCount);
         return false;
     }
 
@@ -112,21 +126,23 @@ float BurstFusionEngine::estimateHighlightAdaptationGain(
             float y0 = 0.114f * static_cast<float>(b0[0]) + 0.587f * static_cast<float>(b0[1]) + 0.299f * static_cast<float>(b0[2]);
             float y1 = 0.114f * static_cast<float>(bk[0]) + 0.587f * static_cast<float>(bk[1]) + 0.299f * static_cast<float>(bk[2]);
 
-            if (y0 >= 210.0f && y0 <= 240.0f && y1 >= 30.0f) {
+            if (y0 >= 180.0f && y0 <= 245.0f && y1 >= 15.0f) {
                 ratios.push_back(y0 / y1);
             }
         }
     }
 
-    if (ratios.size() < 50) {
-        return 1.55f; // -2.0 EV 典型经验默认增益比
+    if (ratios.size() < 20) {
+        LOGI("estimateHighlightAdaptationGain: few samples (%zu), defaulting to 4.0f", ratios.size());
+        return 4.0f;
     }
 
     size_t midIdx = ratios.size() / 2;
     std::nth_element(ratios.begin(), ratios.begin() + midIdx, ratios.end());
     float medRatio = ratios[midIdx];
-
-    return std::clamp(medRatio, 1.05f, 2.5f);
+    float gain = std::clamp(medRatio, 1.05f, 20.0f);
+    LOGI("estimateHighlightAdaptationGain: computed gain=%.2f from %zu samples", gain, ratios.size());
+    return gain;
 }
 
 // ============================================================================
@@ -180,7 +196,14 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
             const cv::Mat& candFrame = burstFrames[k];
             cv::Mat candWarped1x, H;
             if (!alignFrameHomography(candFrame, baseFrame, candWarped1x, H)) {
-                continue;
+                if (k == 1 && isScreenMode) {
+                    LOGW("Frame 1 (HDR highlight frame) ORB alignment failed in dark scene; adopting identity alignment H=I to prevent dropping highlight data");
+                    H = cv::Mat::eye(3, 3, CV_64F);
+                    candWarped1x = candFrame.clone();
+                } else {
+                    LOGW("Frame %zu alignment failed, skipping", k);
+                    continue;
+                }
             }
 
             // 构造 1x 辅帧输入到 2x 超分画布的单应性矩阵: H_2x = S_2 * H
@@ -202,6 +225,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
             if (k == 1 && isScreenMode) {
                 frame1Super = candWarpedSuper.clone();
                 alphaFrame1 = alpha;
+                LOGI("Frame 1 highlight frame registered, adaptation gain=%.2f", alphaFrame1);
             }
 
             #pragma omp parallel for schedule(static)
@@ -221,19 +245,8 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
                     int y0 = (29 * b0[0] + 150 * b0[1] + 77 * b0[2]) >> 8;
                     int yk = (29 * bk[0] + 150 * bk[1] + 77 * bk[2]) >> 8;
 
-                    // 当处于 HDR 融合模式且当前帧为欠曝光高光帧 (alpha > 1.3) 时，对高光区执行 50MP 嫁接
-                    if (isScreenMode && alpha > 1.3f) {
-                        if (y0 >= 235) {
-                            float u = std::clamp((y0 - 235.0f) / 15.0f, 0.0f, 1.0f);
-                            float m = 3.0f * u * u - 2.0f * u * u * u;
-                            for (int c = 0; c < 3; ++c) {
-                                float v0 = static_cast<float>(b0[c]);
-                                float vkAdapted = std::min(v0, alpha * static_cast<float>(bk[c]));
-                                float val = (1.0f - m) * v0 + m * vkAdapted;
-                                pAccum[x][c] += 2.0f * val;
-                            }
-                            pWeight[x] += 2.0f;
-                        }
+                    // 高光饱和区：基准帧已过曝（y0 >= 215），严禁继续累加辅帧，防止 255 白斑稀释 Frame 1 细节
+                    if (isScreenMode && y0 >= 215) {
                         continue;
                     }
 
@@ -270,6 +283,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
         // ─── Vulkan GPU Acceleration Path (SPEC_17) ───
         bool vulkanSuccess = false;
         if (isScreenMode && !frame1Super.empty() && VulkanComputeEngine::getInstance().isSupported()) {
+            LOGI("Dispatching 50MP HDR & Local Tone Mapping to Vulkan GPU (gain=%.2f)...", alphaFrame1);
             cv::Mat baseRgba, shortRgba, outRgba;
             cv::cvtColor(superResult, baseRgba, cv::COLOR_BGR2RGBA);
             cv::cvtColor(frame1Super, shortRgba, cv::COLOR_BGR2RGBA);
@@ -280,10 +294,36 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(const std::vector<cv::Mat>& burstFram
             )) {
                 cv::cvtColor(outRgba, superResult, cv::COLOR_RGBA2BGR);
                 vulkanSuccess = true;
+                LOGI("Vulkan GPU HDR LTM completed successfully!");
+            } else {
+                LOGW("Vulkan GPU HDR LTM execution failed, falling back to CPU");
             }
         }
 
         // CPU Fallback Path (if Vulkan was not supported or failed)
+        if (!vulkanSuccess && isScreenMode && !frame1Super.empty()) {
+            LOGI("Running CPU Hermite highlight graft (gain=%.2f)...", alphaFrame1);
+            #pragma omp parallel for schedule(static)
+            for (int y = 0; y < superRows; ++y) {
+                cv::Vec3b* pDst = superResult.ptr<cv::Vec3b>(y);
+                const cv::Vec3b* pShort = frame1Super.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < superCols; ++x) {
+                    cv::Vec3b& px = pDst[x];
+                    int y0 = (29 * px[0] + 150 * px[1] + 77 * px[2]) >> 8;
+                    if (y0 >= 210) {
+                        float t = std::clamp((y0 - 210.0f) / 35.0f, 0.0f, 1.0f);
+                        float m = 3.0f * t * t - 2.0f * t * t * t;
+                        const cv::Vec3b& s = pShort[x];
+                        for (int c = 0; c < 3; ++c) {
+                            float v0 = static_cast<float>(px[c]);
+                            float vk = std::clamp(static_cast<float>(s[c]) * alphaFrame1, 0.0f, 255.0f);
+                            px[c] = cv::saturate_cast<uchar>((1.0f - m) * v0 + m * vk);
+                        }
+                    }
+                }
+            }
+        }
+
         if (!vulkanSuccess && isScreenMode) {
             #pragma omp parallel for schedule(static)
             for (int y = 0; y < superRows; ++y) {
