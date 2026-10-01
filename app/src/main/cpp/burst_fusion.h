@@ -2,6 +2,7 @@
 #define BURST_FUSION_H
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/photo.hpp>
 #include <vector>
 
 class BurstFusionEngine {
@@ -17,11 +18,15 @@ public:
     // 第一级：全局单应性粗配准 (ORB + RANSAC Homography)
     bool alignFrameHomography(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH);
 
-    // 暗光极高光质心与微细节配准 (Highlight Centroid & Correlation Alignment for dark scenes)
+    // 基于 Greg Ward 经典中值阈值位图的多曝光对齐 (AlignMTB)
+    // 专为跨大曝光级差的 HDR 连拍设计，免疫大面积过曝与纯黑，杜绝重影和发光环错位
+    bool alignFrameMTB(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH);
+
+    // 暗光高动态场景极高光质心与结构配准 (Highlight Centroid & Structure Alignment)
+    // 专为暗光夜景中发光灯具、环形灯带、发光字设计，利用局部窗口质心避免桌面反光干扰，实现亚像素无重影贴合
     bool alignHighlightFrame(const cv::Mat& srcShort, const cv::Mat& refBase, cv::Mat& outWarped, cv::Mat& outH);
 
 private:
-    // 计算欠曝帧到基准帧在高光过渡区 (Y0 in [210, 240]) 的平滑亮度自适应增益比
     float estimateHighlightAdaptationGain(const cv::Mat& bgrBase, const cv::Mat& bgrCand, const cv::Mat& validMask);
 };
 

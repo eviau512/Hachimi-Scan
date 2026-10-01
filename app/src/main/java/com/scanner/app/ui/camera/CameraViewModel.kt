@@ -25,6 +25,7 @@ import com.scanner.app.engine.NativeBurstFusion
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -238,11 +239,15 @@ class CameraViewModel : ViewModel() {
                 // Tier 1: 4 frames at normal AE (EV 0) — Base & Super-Res
                 // Consecutively captured under active AE without interrupting metering
                 // ─────────────────────────────────────────────────────────────
-                for (i in 0 until 4) {
-                    val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t1_$i.jpg")
-                    if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) {
-                        tier1Files.add(f)
+                // Tier 1: 4 frames at normal AE (EV 0) — Base & Super-Res (Parallel Burst Dispatch)
+                coroutineScope {
+                    val t1Jobs = (0 until 4).map { i ->
+                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t1_$i.jpg")
+                        async {
+                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
+                        }
                     }
+                    tier1Files.addAll(t1Jobs.awaitAll().filterNotNull())
                 }
 
                 if (tier1Files.isEmpty()) {
@@ -281,31 +286,37 @@ class CameraViewModel : ViewModel() {
                 )
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 2: 3 frames at Midtone Exposure (-2.5 EV)
+                // Tier 2: 3 frames at Midtone Exposure (-2.5 EV, Parallel Burst Dispatch)
                 // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     setManualCaptureOptions(control, context, midExpNanos, midIso)
-                    delay(80) // Sensor register latch
+                    delay(50) // Sensor register latch
                 }
-                for (i in 0 until 3) {
-                    val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t2_$i.jpg")
-                    if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) {
-                        tier2Files.add(f)
+                coroutineScope {
+                    val t2Jobs = (0 until 3).map { i ->
+                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t2_$i.jpg")
+                        async {
+                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
+                        }
                     }
+                    tier2Files.addAll(t2Jobs.awaitAll().filterNotNull())
                 }
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 3: 2 frames at Short Exposure (-5.0 EV)
+                // Tier 3: 2 frames at Short Exposure (-5.0 EV, Parallel Burst Dispatch)
                 // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     setManualCaptureOptions(control, context, shortExpNanos, shortIso)
-                    delay(80) // Sensor register latch
+                    delay(50) // Sensor register latch
                 }
-                for (i in 0 until 2) {
-                    val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t3_$i.jpg")
-                    if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) {
-                        tier3Files.add(f)
+                coroutineScope {
+                    val t3Jobs = (0 until 2).map { i ->
+                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t3_$i.jpg")
+                        async {
+                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
+                        }
                     }
+                    tier3Files.addAll(t3Jobs.awaitAll().filterNotNull())
                 }
 
                 // Restore Auto-Exposure immediately after burst capture
