@@ -201,15 +201,18 @@ class CameraViewModel : ViewModel() {
     }
 
     // ─────────────────────────────────────────────
-    // Full HDR Unified Capture Pipeline  (SPEC_16 §2)
+    // Apple Deep Fusion / Smart HDR 9-Frame Capture Pipeline
     //
-    // Frame sequence:
-    //   Frame 0: EV  0   (base, spatial reference + super-res anchor)
-    //   Frame 1: EV -2   (highlight recovery)
-    //   Frame 2: EV  0   (sub-pixel super-res aux 1)
-    //   Frame 3: EV  0   (sub-pixel super-res aux 2)
+    // Frame sequence (9 frames total):
+    //   Tier 1 (4 frames, EV 0):
+    //     Frames 0, 1, 2, 3: AE locked, base exposure & sub-pixel super-res anchors
+    //   Tier 2 (3 frames, EV -2.5):
+    //     Frames 4, 5, 6: Manual midtone exposure transition
+    //   Tier 3 (2 frames, EV -5.0):
+    //     Frames 7, 8: Manual deep highlight recovery (lamp bulb/filament un-saturation)
     //
-    // fuseBurstFrames flags: removeGlare=true, isScreenMode=true, superResolution=true
+    // All frames are fused by OpenCV MergeMertens multi-scale Laplacian pyramid
+    // + 50MP sub-pixel high-frequency detail transfer.
     // Output: ~50MP JPEG @ quality 95, EXIF mode = "Full HDR"
     // ─────────────────────────────────────────────
 
@@ -217,7 +220,6 @@ class CameraViewModel : ViewModel() {
         viewModelScope.launch {
             _isCapturing.value = true
             val control = cameraControl
-            val info = cameraInfo
             try {
                 // Wait for stable frame before burst (up to 1.5s)
                 if (!_isStable.value) {
@@ -226,15 +228,28 @@ class CameraViewModel : ViewModel() {
                     }
                 }
 
-                val tempFiles = mutableListOf<File>()
+                val tier1Files = mutableListOf<File>()
+                val tier2Files = mutableListOf<File>()
+                val tier3Files = mutableListOf<File>()
 
-                // Frame 0: EV 0 — base frame
-                val file0 = File(context.cacheDir, "hdr_${UUID.randomUUID()}_0.jpg")
-                if (takeSinglePicture(capture, context, file0) && file0.exists() && file0.length() > 0) {
-                    tempFiles.add(file0)
+                // ─────────────────────────────────────────────────────────────
+                // Tier 1: 4 frames at normal AE (EV 0) — Base & Super-Res
+                // Consecutively captured under active AE without interrupting metering
+                // ─────────────────────────────────────────────────────────────
+                for (i in 0 until 4) {
+                    val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t1_$i.jpg")
+                    if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) {
+                        tier1Files.add(f)
+                    }
+                }
+
+                if (tier1Files.isEmpty()) {
+                    _isCapturing.value = false
+                    return@launch
                 }
 
                 // Inspect Frame 0 exposure parameters from EXIF
+                val file0 = tier1Files[0]
                 val baseIso: Int
                 val baseExpSec: Double
                 if (file0.exists()) {
@@ -246,60 +261,68 @@ class CameraViewModel : ViewModel() {
                     baseExpSec = 0.033
                 }
 
-                // Direct hardware manual exposure for highlight recovery (SPEC_17 §2.1)
-                // In dark scenes (baseIso >= 800 or baseExpSec >= 0.030s), a desk lamp or bright bulb
-                // requires 1/500s @ ISO 100 to completely un-saturate and reveal all surface details.
-                val targetIso = 100
-                val targetExpNanos: Long = if (baseIso >= 800 || baseExpSec >= 0.030) {
-                    2_000_000L // 1/500s
-                } else {
-                    val expSec = (baseExpSec / 16.0).coerceIn(1.0 / 8000.0, 1.0 / 500.0)
-                    (expSec * 1_000_000_000.0).toLong().coerceIn(125_000L, 2_000_000L)
-                }
+                // Tier 2 (-2.5 EV): Midtone Transition
+                val midIso = (baseIso / 3).coerceIn(100, 3200)
+                val midExpSec = (baseExpSec / 2.0).coerceIn(1.0 / 2000.0, 1.0 / 30.0)
+                val midExpNanos = (midExpSec * 1_000_000_000.0).toLong().coerceIn(500_000L, 33_333_333L)
+
+                // Tier 3 (-5.0 EV): Deep Highlight Recovery (Desk lamp bulb & filaments)
+                val shortIso = 100
+                val shortExpSec = (baseExpSec / 16.0).coerceIn(1.0 / 4000.0, 1.0 / 250.0)
+                val shortExpNanos = (shortExpSec * 1_000_000_000.0).toLong().coerceIn(250_000L, 4_000_000L)
+
                 android.util.Log.i(
                     "HachiCam-Burst",
-                    "Base Frame 0: ISO=$baseIso, Exp=${baseExpSec}s. Target Frame 1 manual: ISO=$targetIso, ExpNanos=$targetExpNanos (${1_000_000_000.0 / targetExpNanos}s)"
+                    "Base Frame 0: ISO=$baseIso, Exp=${baseExpSec}s. " +
+                    "Tier 2 Target: ISO=$midIso, Exp=${midExpSec}s ($midExpNanos ns). " +
+                    "Tier 3 Target: ISO=$shortIso, Exp=${shortExpSec}s ($shortExpNanos ns)"
                 )
 
-                // Frame 1: Manual Highlight Recovery (CONTROL_AE_MODE_OFF)
+                // ─────────────────────────────────────────────────────────────
+                // Tier 2: 3 frames at Midtone Exposure (-2.5 EV)
+                // ─────────────────────────────────────────────────────────────
                 if (control != null) {
-                    setManualCaptureOptions(control, context, targetExpNanos, targetIso)
-                    delay(100) // Allow 2 sensor VSYNC frames (~66-100ms) for sensor analog gain and rolling shutter to latch
+                    setManualCaptureOptions(control, context, midExpNanos, midIso)
+                    delay(80) // Sensor register latch
                 }
-                val file1 = File(context.cacheDir, "hdr_${UUID.randomUUID()}_1.jpg")
-                if (takeSinglePicture(capture, context, file1) && file1.exists() && file1.length() > 0) {
-                    tempFiles.add(file1)
+                for (i in 0 until 3) {
+                    val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t2_$i.jpg")
+                    if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) {
+                        tier2Files.add(f)
+                    }
                 }
 
-                // Restore Auto-Exposure (CONTROL_AE_MODE_ON) before capturing aux frames
+                // ─────────────────────────────────────────────────────────────
+                // Tier 3: 2 frames at Short Exposure (-5.0 EV)
+                // ─────────────────────────────────────────────────────────────
+                if (control != null) {
+                    setManualCaptureOptions(control, context, shortExpNanos, shortIso)
+                    delay(80) // Sensor register latch
+                }
+                for (i in 0 until 2) {
+                    val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t3_$i.jpg")
+                    if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) {
+                        tier3Files.add(f)
+                    }
+                }
+
+                // Restore Auto-Exposure immediately after burst capture
                 if (control != null) {
                     clearManualCaptureOptions(control, context)
-                    delay(100) // Allow AE to re-engage for normal exposure on aux frames
                 }
 
-                // Frame 2: EV 0 — sub-pixel aux 1
-                val file2 = File(context.cacheDir, "hdr_${UUID.randomUUID()}_2.jpg")
-                if (takeSinglePicture(capture, context, file2) && file2.exists() && file2.length() > 0) {
-                    tempFiles.add(file2)
+                val allFiles = mutableListOf<File>().apply {
+                    addAll(tier1Files)
+                    addAll(tier2Files)
+                    addAll(tier3Files)
                 }
 
-                // Frame 3: EV 0 — sub-pixel aux 2
-                val file3 = File(context.cacheDir, "hdr_${UUID.randomUUID()}_3.jpg")
-                if (takeSinglePicture(capture, context, file3) && file3.exists() && file3.length() > 0) {
-                    tempFiles.add(file3)
-                }
-
-                if (tempFiles.isEmpty()) {
-                    _isCapturing.value = false
-                    return@launch
-                }
-
-                tempFiles.forEachIndexed { idx, f ->
+                allFiles.forEachIndexed { idx, f ->
                     try {
-                        val ex = androidx.exifinterface.media.ExifInterface(f.absolutePath)
-                        val iso = ex.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
-                        val exp = ex.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_EXPOSURE_TIME)
-                        android.util.Log.i("HachiCam-Burst", "Burst Frame $idx: ISO=$iso, ExpTime=$exp, size=${f.length()} bytes")
+                        val ex = ExifInterface(f.absolutePath)
+                        val iso = ex.getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
+                        val exp = ex.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)
+                        android.util.Log.i("HachiCam-Burst", "Burst Frame $idx (total ${allFiles.size}): ISO=$iso, ExpTime=$exp, size=${f.length()} bytes")
                     } catch (e: Exception) {
                         android.util.Log.w("HachiCam-Burst", "Failed to inspect Frame $idx EXIF: ${e.message}")
                     }
@@ -309,7 +332,7 @@ class CameraViewModel : ViewModel() {
 
                 withContext(Dispatchers.IO) {
                     val mats = mutableListOf<Mat>()
-                    for (file in tempFiles) {
+                    for (file in allFiles) {
                         val mat = Imgcodecs.imread(file.absolutePath)
                         if (!mat.empty()) mats.add(mat)
                     }
@@ -319,24 +342,24 @@ class CameraViewModel : ViewModel() {
                         val fusedMat = fusionEngine.fuseBurstFrames(
                             burstFrames = mats,
                             removeGlare = true,
-                            isScreenMode = true,   // HDR highlight graft + shadow S-curve
-                            superResolution = true  // 2× canvas → ~50MP
+                            isScreenMode = true,
+                            superResolution = true
                         )
                         if (!fusedMat.empty()) {
-                            rotateAndSaveFusedMat(fusedMat, tempFiles[0], finalPhotoFile, mode = "Full HDR", jpegQuality = 95)
+                            rotateAndSaveFusedMat(fusedMat, allFiles[0], finalPhotoFile, mode = "Full HDR", jpegQuality = 95)
                         } else {
-                            tempFiles[0].copyTo(finalPhotoFile, overwrite = true)
+                            allFiles[0].copyTo(finalPhotoFile, overwrite = true)
                             normalizeExifOrientation(finalPhotoFile)
                             ExifUtils.stampSignature(finalPhotoFile, mode = "Full HDR")
                         }
                         for (m in mats) m.release()
                     } else {
-                        tempFiles[0].copyTo(finalPhotoFile, overwrite = true)
+                        allFiles[0].copyTo(finalPhotoFile, overwrite = true)
                         normalizeExifOrientation(finalPhotoFile)
                         ExifUtils.stampSignature(finalPhotoFile, mode = "Full HDR")
                     }
 
-                    for (f in tempFiles) f.delete()
+                    for (f in allFiles) f.delete()
                 }
 
                 val (photoW, photoH) = getImageDimensions(finalPhotoFile)

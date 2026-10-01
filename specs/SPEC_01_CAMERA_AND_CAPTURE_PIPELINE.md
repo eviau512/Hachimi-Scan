@@ -63,19 +63,18 @@ To ensure that burst captures occur when hand jitter is minimal:
 
 ---
 
-## 5. Full HDR 4-Frame Unified Capture Pipeline / Full HDR 连拍管线
+## 5. Apple Deep Fusion / Smart HDR 9-Frame Unified Capture Pipeline / 9帧曝光金字塔连拍管线
 
 ### 5.1 The Frame Sequence & Exposure Contract
-To capture high dynamic range without depending on sluggish or clamped Auto-Exposure (AE) convergence algorithms in dark environments, the pipeline implements **direct hardware sensor manual injection**:
+To achieve wide dynamic range and super-resolution without severe exposure cliffs or AE hunting oscillation, the pipeline implements an **Apple Deep Fusion / Smart HDR 9-frame capture pyramid** structured into 3 exposure tiers:
 
-| Frame Index | Capture Mode | Shutter Speed (`SENSOR_EXPOSURE_TIME`) | ISO (`SENSOR_SENSITIVITY`) | Functional Purpose |
-|:---:|:---:|:---:|:---:|:---|
-| **Frame 0** | Auto-Exposure (AE) | Hardware Metered (e.g. 1/30s) | Hardware Metered (e.g. 5104) | Spatial geometric anchor & dark SNR base |
-| **Frame 1** | **Direct Manual** (`CONTROL_AE_MODE_OFF`) | **Mandatory 1/500s (2ms) in dark scenes** | **Mandatory 100 (Base ISO)** | **Extreme highlight un-saturation: desk lamps, bulbs, specular reflections** |
-| **Frame 2** | Auto-Exposure (AE) | Restored to Base AE | Restored to Base AE | Sub-pixel phase offset auxiliary 1 (denoise) |
-| **Frame 3** | Auto-Exposure (AE) | Restored to Base AE | Restored to Base AE | Sub-pixel phase offset auxiliary 2 (50MP super-res) |
+| Frame Range | Tier & Exposure | Camera Control Mode | Functional Purpose |
+|:---:|:---:|:---:|:---|
+| **Frames 0–3** | **Tier 1 (EV 0 Base)** | Active AE Locked (No 3A reset) | Sub-pixel super-resolution anchors, temporal denoise ($1/\sqrt{4}$ SNR boost), geometric reference. |
+| **Frames 4–6** | **Tier 2 (EV -2.5 Mid)** | Manual (`CONTROL_AE_MODE_OFF`) | Smooth midtone transition, prevents glare blowout, preserves room and wall illumination tones. |
+| **Frames 7–8** | **Tier 3 (EV -5.0 Short)** | Manual (`CONTROL_AE_MODE_OFF`) | Extreme highlight recovery: lamp filaments, lightbulb markings, and specular un-saturation at ISO 100. |
 
-### 5.2 Direct Hardware Exposure Injection Sequence
+### 5.2 9-Frame Exposure Sequence Diagram
 ```mermaid
 sequenceDiagram
     participant VM as CameraViewModel
@@ -83,27 +82,24 @@ sequenceDiagram
     participant S as CMOS Sensor & ISP
     participant Storage as Cache Storage
 
-    VM->>S: 1. takeSinglePicture() [Normal AE]
-    S-->>Storage: Frame 0 JPEG (e.g. ISO 5104, 1/30s)
+    Note over VM,S: Tier 1: 4 Frames at EV 0 (Base AE)
+    VM->>S: 1. takeSinglePicture() x 4 (Frames 0, 1, 2, 3)
+    S-->>Storage: Tier 1 JPEGs (Base ISO, Base Exp)
     VM->>VM: Inspect Frame 0 EXIF (baseIso, baseExpSec)
 
-    alt Dark Scene (baseIso >= 800 or baseExpSec >= 0.030s)
-        VM->>C2: setCaptureRequestOptions(AE_OFF, ISO=100, Exp=2ms [1/500s])
-    else Moderate / Daylight Scene
-        VM->>C2: setCaptureRequestOptions(AE_OFF, ISO=100, Exp=baseExpSec/16)
-    end
+    Note over VM,S: Tier 2: 3 Frames at EV -2.5 (Midtone Transition)
+    VM->>C2: setCaptureRequestOptions(midExp, midIso)
+    VM->>VM: delay(80ms) for sensor register latching
+    VM->>S: 2. takeSinglePicture() x 3 (Frames 4, 5, 6)
+    S-->>Storage: Tier 2 JPEGs
 
-    VM->>VM: delay(100ms) for VSYNC register latching
-    VM->>S: 2. takeSinglePicture() [Manual Highlight Frame]
-    S-->>Storage: Frame 1 JPEG (ISO 100, 1/500s)
+    Note over VM,S: Tier 3: 2 Frames at EV -5.0 (Deep Highlight Recovery)
+    VM->>C2: setCaptureRequestOptions(shortExp, shortIso=100)
+    VM->>VM: delay(80ms) for sensor register latching
+    VM->>S: 3. takeSinglePicture() x 2 (Frames 7, 8)
+    S-->>Storage: Tier 3 JPEGs
 
     VM->>C2: clearCaptureRequestOptions() (Restores AE)
-    VM->>VM: delay(100ms) for 3A re-engagement
-    VM->>S: 3. takeSinglePicture() [Restored AE]
-    S-->>Storage: Frame 2 JPEG
-    VM->>S: 4. takeSinglePicture() [Restored AE]
-    S-->>Storage: Frame 3 JPEG
-
     VM->>VM: NativeBurstFusion.fuseBurstFrames(mats, isScreenMode=true, superResolution=true)
 ```
 
