@@ -2,6 +2,7 @@
 ## 技术规格书 02：计算摄影与多尺度拉普拉斯 HDR 曝光融合规范
 
 > **Document Status**: Authoritative Core Pipeline Specification  
+> **Implementation Status**: v16 deployed (`versionCode=16`, commit `7061920`, branch `gpu-hdr`); v17 planned (low-light ISP denoising pipeline)  
 > **Consolidates**: Legacy SPEC_04 (Burst Fusion), SPEC_08 (Stability), SPEC_09 (De-ghosting), SPEC_10 (Highlight Grafting), SPEC_12 (Saturation Grafting), SPEC_13 (Tone Mapping), SPEC_17 (Vulkan Pipeline), and SPEC_18 (Smart HDR 9-Frame Architecture)  
 > **Target Audience**: Computer Vision & Computational Photography Engineers  
 > **Languages**: Primary: English / Secondary: Chinese (Bilingual Executive Summaries)
@@ -10,20 +11,20 @@
 
 ## 1. Mathematical Architecture Overview / 算法全景
 
-The computational photography engine implements an **Apple Deep Fusion / Smart HDR 9-Frame Multi-Exposure Pyramid** coupled with **OpenCV `createMergeMertens` Multi-Scale Laplacian Pyramid Fusion** and **Two-Scale Frequency Super-Resolution**:
+The computational photography engine implements an **Apple Deep Fusion / Smart HDR 7-Frame Multi-Exposure Pyramid** coupled with **OpenCV `createMergeMertens` Multi-Scale Laplacian Pyramid Fusion** and **Two-Scale Frequency Super-Resolution**:
 
 ```mermaid
 graph TD
-    subgraph Input_Frames ["Raw Input Exposures (9 Frames across 3 Tiers)"]
+    subgraph Input_Frames ["Raw Input Exposures (7 Frames across 3 Tiers)"]
         T1["Tier 1: Frames 0–3 (EV 0 Base AE / 4-Phase Super-Res)"]
-        T2["Tier 2: Frames 4–6 (EV -2.5 Midtone Transition)"]
-        T3["Tier 3: Frames 7–8 (EV -5.0 Filament & Deep Highlight)"]
+        T2["Tier 2: Frames 4–5 (EV -2.5 Midtone Transition)"]
+        T3["Tier 3: Frame 6 (EV -6.0 Filament & Deep Highlight)"]
     end
 
-    subgraph Alignment ["ORB Homography & Multi-Phase Alignment"]
+    subgraph Alignment ["ORB Homography & Multi-Phase Alignment (v16)"]
         Align1["Tier 1 Alignment to Frame 0 (H_2x = S_2 * H)"]
         Align2["Tier 2 Relative Alignment & Chain Composition (H_k = H_mid0 * H_rel)"]
-        Align3["Tier 3 Highlight Alignment with Dark-Scene Fallback (H = I)"]
+        Align3["Tier 3 Multi-ROI RANSAC Rigid Affine (Multi-Peak Light Source Matching)"]
     end
 
     subgraph Reconstruction ["Exposure Plate Reconstruction"]
@@ -46,7 +47,8 @@ graph TD
 
     subgraph PostProcessing ["Cinema-Grade Color & Texture Refinement"]
         Toe["Cinematic S-Curve Toe Damping (Y <= 28)"]
-        Texture["Adaptive Micro-Contrast Texture Synthesis (tau=2, beta=0.55)"]
+        Texture["[v16] Adaptive Micro-Contrast Synthesis (tau=2, beta=0.55) — DEPRECATED in low-light scenes (v17)"]
+        ISP["[v17] YCrCb ISP Denoising: Chroma Gaussian σ=3 + Luma Bilateral + Edge-Likelihood Coring Mask"]
     end
 
     Input_Frames --> Alignment
@@ -65,30 +67,68 @@ graph TD
 ### 2.1 The Three Exposure Tiers
 To prevent single-step exposure cliffs (which cause sensor noise amplification and color distortion):
 1. **Tier 1 (Frames 0, 1, 2, 3)**:
-   - Exposure: EV 0 (Base Auto-Exposure locked).
+   - Exposure: EV 0 (Base Auto-Exposure locked, `baseIso` up to 17984, `baseExpSec` ≈ 58 ms).
    - Captured consecutively without AE interruption.
    - Micro-shifts from natural hand tremor provide the 4 sub-pixel sampling phases.
    - Temporal noise reduction: $1/\sqrt{4} = 50\%$ SNR boost in shadows and midtones.
-2. **Tier 2 (Frames 4, 5, 6)**:
-   - Exposure: $\approx -2.5$ EV ($\text{midIso} = \text{baseIso}/3$, $\text{midExp} = \text{baseExp}/2$).
-   - Captured under manual Camera2 settings (`CONTROL_AE_MODE_OFF`).
+2. **Tier 2 (Frames 4, 5)**:
+   - Exposure: $\approx -2.5$ EV ($\text{midIso} = \text{clamp}(\text{baseIso}/4,\ 100,\ 3200)$, $\text{midExpSec} = \text{clamp}(\text{baseExpSec}/3,\ 1/2000,\ 1/30)$).
+   - Captured under manual Camera2 settings (`CONTROL_AE_MODE_OFF`), with 40 ms sensor register latch delay per tier switch.
    - Smoothly captures the transition between ambient room lighting and direct light source glow.
-3. **Tier 3 (Frames 7, 8)**:
-   - Exposure: $\approx -5.0$ EV ($\text{shortIso} = 100$, $\text{shortExp} = \text{baseExp}/16$).
+3. **Tier 3 (Frame 6)**:
+   - Exposure: $\approx -6.0$ EV ($\text{shortIso} = \text{clamp}(\text{midIso}/8,\ 100,\ 800)$, $\text{shortExpSec} = \text{clamp}(\text{midExpSec}/4,\ 1/4000,\ 1/250)$).
    - Completely un-saturates lightbulbs, filaments, and printed lamp labels.
 
+**Timing & Performance (v15+, OnePlus 13T, Snapdragon 8 Elite):**
+- Inter-tier sensor latch delay: **40 ms** per tier switch (`delay(40)` in `CameraViewModel`).
+- Total capture sequence (7 frames across 3 tiers): **~400 ms** (down from ~800 ms in earlier 9-frame design).
+- End-to-end shutter-to-final-image latency: **~5.39 s** (including C++ fusion, JPEG encode, EXIF write).
+
 ### 2.2 Robust Homography Alignment & Chain Composition
-- **Feature Extraction**: ORB (1200 keypoints) downsampled to max dimension 960 for sub-20ms speed.
+#### 2.2.1 Tier 1 & 2: ORB Feature-Based Homography
+- **Feature Extraction**: ORB (1200 keypoints) downsampled to max dimension 960 for sub-20 ms speed.
 - **Hamming Cross-Check & RANSAC**:
   - Distance threshold: 3.0 pixels.
   - Inlier threshold: $N_{\text{inliers}} \ge 15$, ratio $\ge 0.10$.
   - Affine determinant check: $|\det(H) - 1.0| \le 0.40$.
 - **Chain Composition**:
   - Within Tier 2: $H_{k \to 0} = H_{\text{mid}0} \cdot H_{k \to 4}$.
-  - Within Tier 3: $H_{k \to 0} = H_{\text{short}0} \cdot H_{k \to 7}$.
-- **Dark Scene Resilience**: If Tier 3 has no ambient features in a dark room, identity fallback $H = I$ is adopted, locking highlight structures without dropping frames.
+  - Tier 3 (via Tier 2 bridge): $H_{k \to 0} = H_{\text{short}0} \cdot H_{k \to 6}$.
+
+#### 2.2.2 Tier 3: Multi-ROI RANSAC Rigid Affine Highlight Alignment (v16, `alignHighlightTemplate`)
+
+> **Background**: In a dark room, Tier 3 frames lack ambient scene features for ORB. The engine aligns on the only high-contrast structures present: the light sources themselves (bulbs, lamp filaments).
+
+**Algorithm (`burst_fusion.cpp` L.218–L.449):**
+
+1. **Highlight ROI Extraction**: Downsample 1/4×. Threshold $Y > 200$. `connectedComponentsWithStats` → components with area > 15 px.
+2. **Non-Maximum Suppression (NMS)**: Score = `mean_Y × sqrt(area)`. Suppress centroids within 40 px of a higher-scored peer. Retain top-8 light sources.
+3. **Per-Source NCC Sub-pixel Matching**: For each source centroid, extract 32×32 px patch from reference frame. `matchTemplate(TM_CCOEFF_NORMED)`. Accept if score ≥ 0.45; record sub-pixel displacement.
+4. **RANSAC Rigid Affine Fitting**:
+   - $N \ge 3$ matches: `estimateAffinePartial2D` RANSAC → 4-DOF rigid body: $(t_x, t_y, s, \theta)$.
+   - Physical self-check: $s \in [0.95, 1.05]$, $|\theta| < 5°$, $\|\mathbf{t}\| \le 45$ px (1/4-scale).
+   - $N = 1$: degenerate to pure translation from highest-confidence match.
+   - $N = 0$: identity fallback $H = I$.
+5. **Upscale**: affine → $H_{3\times3}$; translation components ×4 to restore full-resolution scale.
+
+**v16 Real-World Validation (OnePlus 13T, ISO 17984, commit `7061920`):**
+```
+alignHighlightTemplate: matched light peak at (1035,877), score=0.6829, dx=11.95
+alignHighlightTemplate: matched light peak at (646,1004), score=0.6200, dx=9.93
+alignHighlightTemplate: fitted Multi-Peak Rigid Affine: s=1.0060, rot=-0.132 deg, tx=8.03
+```
+
+#### 2.2.3 Four-Level Alignment Cascade (`alignHighlightFrame`)
+
+| Priority | Method | Trigger Condition |
+|:---|:---|:---|
+| 1 | ORB `alignFrameHomography` | Sufficient ambient features ($N_{\text{inliers}} \ge 15$) |
+| 2 | `alignHighlightTemplate` (v16 Multi-ROI RANSAC) | ORB fails but bright light sources present |
+| 3 | Phase Correlation `alignGradientPhaseCorrelation` | No light sources, but gradient structure |
+| 4 | Identity $H = I$ | Complete fallback (featureless dark scene) |
 
 ---
+
 
 ## 3. OpenCV `createMergeMertens` Multi-Scale Fusion / 多尺度拉普拉斯融合
 
@@ -115,7 +155,18 @@ Unlike single-threshold pixel replacement (which causes grey halos or color frin
    $$L_{\text{fused}, l}(x, y) = \sum_{k} G_l\{\hat{W}_k\}(x, y) \cdot L_l\{I_k\}(x, y)$$
 4. Collapse the Laplacian pyramid to reconstruct the artifact-free HDR composite $I_{\text{hdr\_12M}}$.
 
+### 3.3 1/2-Resolution Downsampling Acceleration (v15+)
+
+Before feeding plates into `MergeMertens`, each 12MP plate ($4080 \times 3072$) is area-downsampled to 1/2 linear resolution ($2040 \times 1536$) with `INTER_AREA`:
+
+$$I^{(1/2)}_k = \text{resize}(I_k,\ W/2,\ H/2,\ \text{INTER\_AREA})$$
+
+After fusion the result is upscaled back to 12MP before entering §4.
+
+**Rationale**: Laplacian pyramid construction cost scales as $O(W \cdot H)$; halving linear dimensions reduces the pyramid computation to **25% of the original area**, cutting memory from ~450 MB to ~115 MB and CPU time from ~2300 ms to **~120 ms** — a 19× speedup with negligible quality impact (pyramid levels below the Nyquist limit are unaffected).
+
 ---
+
 
 ## 4. Two-Scale Frequency Super-Resolution (50MP) / 双尺度高频超分重构
 
@@ -131,15 +182,80 @@ Direct 50MP Laplacian pyramid processing requires $>3.2\,\text{GB}$ of memory al
    $$D_{\text{final}} = (1.0 - \alpha_{\text{highlight}}) \cdot D_{\text{base\_50M}} + \alpha_{\text{highlight}} \cdot D_{\text{short\_50M}}$$
    $$I_{\text{final\_50M}} = \text{clamp}(I_{\text{fused\_50M\_smooth}} + D_{\text{final}}, 0, 255)$$
 
+
 ---
 
 ## 5. Post-Refinement Passes / 后处理优化
 
-1. **Cinematic S-Curve Toe Damping ($Y \le 28.0$)**:
-   $$u = \frac{Y}{28.0}, \quad Y_{\text{tone}} = Y \cdot u^{0.65}$$
-   $$\text{scale} = \frac{Y_{\text{tone}}}{\max(Y, 0.001)}, \quad C_{\text{final}} = \text{clamp}(C \cdot \text{scale}, 0, 255)$$
-   Deepens blacks and eliminates dark shadow chromatic noise.
-2. **Adaptive Micro-Contrast Texture Synthesis**:
-   $$D = Y - Y_{\text{blur}}, \quad \text{if } |D| > 2: \quad \Delta Y = \text{sign}(D) \cdot \min((|D| - 2) \cdot 0.55, 16.0)$$
-   $$C_{\text{final}} = \text{clamp}(C + \Delta Y, 0, 255)$$
-   Sharpens document ink, text edges, and fine paper textures.
+### 5.1 Step 5: Cinematic S-Curve Toe Damping ✅ (Active)
+
+$$u = \frac{Y}{28.0}, \quad Y_{\text{tone}} = Y \cdot u^{0.65}$$
+$$\text{scale} = \frac{Y_{\text{tone}}}{\max(Y, 0.001)}, \quad C_{\text{final}} = \text{clamp}(C \cdot \text{scale}, 0, 255)$$
+
+Deepens blacks and eliminates dark shadow chromatic noise. Applies only to $Y \le 28$.
+
+---
+
+### 5.2 Step 6: Adaptive Micro-Contrast Texture Synthesis ⚠️ DEPRECATED in Low-Light (v17)
+
+> [!WARNING]
+> **Root Cause of Low-Light Noise Degradation.** At ISO ≥ 8000 (flat-surface noise σ ≈ 18, amplitude ±30), the blind threshold `tau=2` treats ~90% of shot noise as "texture" and amplifies it via `beta=0.55`. This transforms the smooth lamp base into a noisy smear while providing zero benefit to actual text edges. **This pass must be gated or replaced in v17.**
+
+**Current implementation (v16, `burst_fusion.cpp` Step 6):**
+$$D = Y - Y_{\text{blur}}, \quad \text{if } |D| > 2: \quad \Delta Y = \text{sign}(D) \cdot \min((|D| - 2) \cdot 0.55,\ 16.0)$$
+$$C_{\text{final}} = \text{clamp}(C + \Delta Y, 0, 255)$$
+
+**Failure mode**: $\tau = 2 \ll \sigma_{\text{noise}} \approx 18$, so the gate is always open, amplifying noise in every flat region (walls, lamp bases, white paper).
+
+---
+
+### 5.3 [v17 REQUIRED] YCrCb Structure-Aware ISP Denoising Pipeline
+
+**Goal**: Match MotoCam's "butter-smooth" flat areas while retaining HachiCam's text/edge sharpness. Validated via Python prototype on v16 test shots (ISO 17984, 台灯 scene).
+
+#### 5.3.1 Noise vs. Structure Discriminator — Edge-Likelihood Coring Mask
+
+Distinguishing noise from real edges requires a per-pixel gradient signal in the luma channel:
+
+$$M_{\text{edge}}(x,y) = \text{clamp}\!\left(\frac{|\nabla Y(x,y)| - \tau_{\text{noise}}}{\sigma_{\text{trans}}},\ 0,\ 1\right)$$
+
+| Parameter | Value | Rationale |
+|:---|:---|:---|
+| $\tau_{\text{noise}}$ | 22 | Just above $\sigma_{\text{noise}} \approx 18$ at ISO 17984 |
+| $\sigma_{\text{trans}}$ | 25 | Smooth gradient → $M=0$ (noise), strong edge → $M=1$ (structure) |
+
+- $M_{\text{edge}} \approx 0$: flat region (noise-dominant) → apply heavy smoothing branch
+- $M_{\text{edge}} \approx 1$: text/edge region → apply sharpening branch
+
+#### 5.3.2 YCrCb Separation & Chroma Denoising
+
+Convert the output of Step 5 to YCrCb:
+
+- **Chroma (Cr, Cb)**: apply `GaussianBlur(σ=3.0, kernel=9×9)` independently on each channel.
+  - Color noise in Cr/Cb is always random; large-radius Gaussian is safe and has zero effect on luminance detail.
+- **Luma (Y)**: split into two branches gated by $M_{\text{edge}}$.
+
+#### 5.3.3 Luma Dual-Branch Processing
+
+| Branch | Condition | Operation |
+|:---|:---|:---|
+| **Smooth** (flat region) | $M_{\text{edge}} \approx 0$ | `bilateralFilter(Y, d=7, σ_color=35, σ_space=7)` |
+| **Sharp** (text/edge) | $M_{\text{edge}} \approx 1$ | $Y_{\text{sharp}} = 1.35 \cdot Y - 0.35 \cdot \text{GaussianBlur}(Y, \sigma=2)$ (Unsharp Mask) |
+
+**Blended output:**
+$$Y_{\text{final}} = (1 - M_{\text{edge}}) \cdot Y_{\text{smooth}} + M_{\text{edge}} \cdot Y_{\text{sharp}}$$
+
+#### 5.3.4 Integration with Step 6 Replacement
+
+In v17, Step 6 (`burst_fusion.cpp`) shall be rewritten as:
+1. Convert `fused50M` from BGR to YCrCb.
+2. Extract Y, Cr, Cb planes.
+3. Compute gradient magnitude map on Y; derive $M_{\text{edge}}$.
+4. Apply Gaussian (σ=3) to Cr and Cb.
+5. Apply bilateral filter to Y for flat regions; Unsharp Mask for edge regions.
+6. Blend using $M_{\text{edge}}$ mask.
+7. Merge back to BGR.
+
+> [!IMPORTANT]
+> **Regression guard**: document-scanning text sharpness must not regress. The $M_{\text{edge}}$ sharpening branch must engage whenever ink strokes are present. Run side-by-side comparison on a printed A4 sheet with 8pt font before merging v17.
+

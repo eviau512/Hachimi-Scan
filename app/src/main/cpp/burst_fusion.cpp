@@ -917,45 +917,74 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
             }
         }
 
-        // ── 步骤 6: 极速微反差质感合成 (降采样低频高斯滤波加速 10 倍) ──
-        cv::Mat smallY(rows, cols, CV_8UC1);
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < rows; ++y) {
-            const cv::Vec3b* pDst = superResult.ptr<cv::Vec3b>(y * 2);
-            uchar* pY = smallY.ptr<uchar>(y);
-            for (int x = 0; x < cols; ++x) {
-                const cv::Vec3b& px = pDst[x * 2];
-                pY[x] = static_cast<uchar>((29 * px[0] + 150 * px[1] + 77 * px[2]) >> 8);
-            }
-        }
+        // ── 步骤 6 (v17): YCrCb 结构感知 ISP 降噪管线 ──────────────────────────
+        // SPEC_02 §5.3: 替换盲微反差 (tau=2, beta=0.55) —— 在高 ISO 暗光下会将
+        // σ≈18 的散粒噪声放大为"纹理"。新方案通过梯度判别掩模自适应分支：
+        //   · 平坦区 (M≈0) → bilateral 平滑 (奶油质感)
+        //   · 文字/边缘区 (M≈1) → Unsharp Mask 锐化 (保持文字锋利)
+        // Chroma (Cr/Cb) 独立施加大半径高斯降噪，不影响任何亮度细节。
+        // ────────────────────────────────────────────────────────────────────────
 
-        cv::Mat smallBlur;
-        cv::GaussianBlur(smallY, smallBlur, cv::Size(3, 3), 1.2);
-        cv::Mat fullBlur;
-        cv::resize(smallBlur, fullBlur, cv::Size(superCols, superRows), 0, 0, cv::INTER_LINEAR);
+        LOGI("Step6 ISP: converting to YCrCb (superResult %dx%d)", superCols, superRows);
 
-        const int tau = 2;
-        const float beta = 0.55f;
+        // 1. BGR → YCrCb
+        cv::Mat ycrcb;
+        cv::cvtColor(superResult, ycrcb, cv::COLOR_BGR2YCrCb);
 
-        #pragma omp parallel for schedule(static)
-        for (int y = 0; y < superRows; ++y) {
-            const uchar* pYBlur = fullBlur.ptr<uchar>(y);
-            cv::Vec3b* pDst = superResult.ptr<cv::Vec3b>(y);
+        // 2. 分离三通道
+        std::vector<cv::Mat> channels(3);
+        cv::split(ycrcb, channels);
+        cv::Mat& Y_ch  = channels[0];   // 亮度
+        cv::Mat& Cr_ch = channels[1];   // 红色差
+        cv::Mat& Cb_ch = channels[2];   // 蓝色差
 
-            for (int x = 0; x < superCols; ++x) {
-                cv::Vec3b& px = pDst[x];
-                int curY = (29 * px[0] + 150 * px[1] + 77 * px[2]) >> 8;
-                int D = curY - static_cast<int>(pYBlur[x]);
-                int absD = std::abs(D);
-                if (absD > tau) {
-                    float sign = (D > 0) ? 1.0f : -1.0f;
-                    float deltaY = sign * std::min(static_cast<float>(absD - tau) * beta, 16.0f);
-                    px[0] = cv::saturate_cast<uchar>(static_cast<float>(px[0]) + deltaY);
-                    px[1] = cv::saturate_cast<uchar>(static_cast<float>(px[1]) + deltaY);
-                    px[2] = cv::saturate_cast<uchar>(static_cast<float>(px[2]) + deltaY);
-                }
-            }
-        }
+        // 3. Chroma 降噪: 大半径高斯 (σ=3, 9×9) 独立作用于 Cr/Cb
+        //    色彩噪声各向同性随机，Gaussian 安全且对亮度零影响
+        cv::GaussianBlur(Cr_ch, Cr_ch, cv::Size(9, 9), 3.0);
+        cv::GaussianBlur(Cb_ch, Cb_ch, cv::Size(9, 9), 3.0);
+
+        // 4. 计算亮度梯度掩模 M_edge ∈ [0, 1]
+        //    τ_noise=22 (略高于 ISO 17984 下的 σ_noise≈18)
+        //    σ_trans=25 (平滑过渡带宽)
+        //    噪点: |∇Y| < τ_noise → M≈0 → 走平滑分支
+        //    文字: |∇Y| >> τ_noise → M≈1 → 走锐化分支
+        cv::Mat Y_float;
+        Y_ch.convertTo(Y_float, CV_32F);
+
+        cv::Mat grad_x, grad_y, grad_mag;
+        cv::Sobel(Y_float, grad_x, CV_32F, 1, 0, 3);
+        cv::Sobel(Y_float, grad_y, CV_32F, 0, 1, 3);
+        cv::magnitude(grad_x, grad_y, grad_mag);
+
+        const float tau_noise   = 22.0f;
+        const float sigma_trans = 25.0f;
+        cv::Mat M_edge = (grad_mag - tau_noise) / sigma_trans;
+        cv::threshold(M_edge, M_edge, 0.0f, 0.0f, cv::THRESH_TOZERO);   // clamp 下界
+        cv::min(M_edge, 1.0f, M_edge);                                   // clamp 上界
+
+        // 5. 平坦分支: Bilateral Filter (保边平滑, d=7, σ_color=35, σ_space=7)
+        cv::Mat Y_smooth_float;
+        cv::bilateralFilter(Y_float, Y_smooth_float, 7, 35.0, 7.0);
+
+        // 6. 锐化分支: Unsharp Mask (amount=0.35, σ=2.0)
+        //    Y_sharp = 1.35·Y - 0.35·Gaussian(Y, σ=2)
+        cv::Mat Y_gauss;
+        cv::GaussianBlur(Y_float, Y_gauss, cv::Size(0, 0), 2.0);
+        cv::Mat Y_sharp_float = Y_float * 1.35f - Y_gauss * 0.35f;
+
+        // 7. 按掩模 alpha 混合: Y_final = (1-M)·Y_smooth + M·Y_sharp
+        cv::Mat Y_final_float = Y_smooth_float.mul(1.0f - M_edge)
+                              + Y_sharp_float.mul(M_edge);
+        cv::threshold(Y_final_float, Y_final_float, 0.0f,   0.0f, cv::THRESH_TOZERO);
+        cv::min(Y_final_float, 255.0f, Y_final_float);
+
+        Y_final_float.convertTo(Y_ch, CV_8U);
+
+        // 8. 合并回 YCrCb → BGR
+        cv::merge(channels, ycrcb);
+        cv::cvtColor(ycrcb, superResult, cv::COLOR_YCrCb2BGR);
+
+        LOGI("Step6 ISP: done");
 
         return superResult;
     }
