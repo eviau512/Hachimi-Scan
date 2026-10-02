@@ -99,11 +99,28 @@ object LogCollector {
                     false
                 }
 
+                val myPid = android.os.Process.myPid()
+                sb.appendLine("--- Application Specific Logcat (PID: $myPid) ---")
+                try {
+                    val appLogProc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "time", "--pid=$myPid", "-t", "3000"))
+                    BufferedReader(InputStreamReader(appLogProc.inputStream)).use { reader ->
+                        var line: String?
+                        while (reader.readLine().also { line = it } != null) {
+                            sb.appendLine(line)
+                        }
+                    }
+                    appLogProc.waitFor()
+                } catch (e: Exception) {
+                    sb.appendLine("Failed to collect app PID logcat: ${e.message}")
+                }
+                sb.appendLine()
+
+                sb.appendLine("--- System & Camera HAL Logcat ---")
                 val process = if (hasSu) {
                     sb.appendLine("(Root permission detected: capturing system & Qualcomm Camera HAL logs)")
-                    Runtime.getRuntime().exec(arrayOf("su", "-c", "logcat -d -v time -t 4000"))
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", "logcat -d -v time -t 3000"))
                 } else {
-                    Runtime.getRuntime().exec("logcat -d -v time -t 2000")
+                    Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "time", "-t", "2000"))
                 }
 
                 BufferedReader(InputStreamReader(process.inputStream)).use { reader ->

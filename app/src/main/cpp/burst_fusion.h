@@ -18,6 +18,10 @@ public:
     // 第一级：全局单应性粗配准 (ORB + RANSAC Homography)
     bool alignFrameHomography(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH);
 
+    // 增强相关系数配准 (Enhanced Correlation Coefficient, ECC)
+    // 专为跨曝光级差、屏幕摩尔纹与低对比度场景设计，具备亚像素刚体精度与完全光度不变性
+    bool alignFrameECC(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH);
+
     // 基于 Greg Ward 经典中值阈值位图的多曝光对齐 (AlignMTB)
     // 专为跨大曝光级差的 HDR 连拍设计，免疫大面积过曝与纯黑，杜绝重影和发光环错位
     bool alignFrameMTB(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH);

@@ -129,7 +129,7 @@ android-scan-app/
 | Pipeline Stage | Target Latency | Threading / Hardware | Failure Tolerance |
 |:---|:---:|:---|:---|
 | **Preview Edge Detection** | ≤ 25 ms / frame (40+ FPS) | Background Single Thread (Y-downsampled) | Smooth fallback to inset quad |
-| **Full HDR 4-Frame Burst** | ≤ 600 ms total capture | Camera2 hardware direct pipeline | Capture minimum 1 frame if burst aborts |
+| **Full HDR 7-Frame Burst** | ≤ 400 ms total capture | Camera2 hardware direct pipeline | Capture minimum 1 frame if burst aborts |
 | **50MP Vulkan HDR Fusion** | ≤ 550 ms | Qualcomm Adreno 752 / Mali GPU Compute | Seamless fallback to CPU OpenMP |
 | **CPU OpenMP Fallback** | ≤ 2800 ms | 8-core static scheduling | Complete execution without crash |
 | **Filter Processing** | ≤ 45 ms / 12MP | Multi-threaded C++ OpenMP / NEON | Return original image if empty |

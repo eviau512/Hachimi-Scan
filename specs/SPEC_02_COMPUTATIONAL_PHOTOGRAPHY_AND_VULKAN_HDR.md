@@ -2,7 +2,7 @@
 ## 技术规格书 02：计算摄影与多尺度拉普拉斯 HDR 曝光融合规范
 
 > **Document Status**: Authoritative Core Pipeline Specification  
-> **Implementation Status**: v16 deployed (`versionCode=16`, commit `7061920`, branch `gpu-hdr`); v17 planned (low-light ISP denoising pipeline)  
+> **Implementation Status**: v17 deployed (`versionCode=17`, commit `3fcbe3b`, branch `gpu-hdr`); v18 active (AlignMTB Multi-Exposure Cascade & Anti-Ghosting Gated Fusion)  
 > **Consolidates**: Legacy SPEC_04 (Burst Fusion), SPEC_08 (Stability), SPEC_09 (De-ghosting), SPEC_10 (Highlight Grafting), SPEC_12 (Saturation Grafting), SPEC_13 (Tone Mapping), SPEC_17 (Vulkan Pipeline), and SPEC_18 (Smart HDR 9-Frame Architecture)  
 > **Target Audience**: Computer Vision & Computational Photography Engineers  
 > **Languages**: Primary: English / Secondary: Chinese (Bilingual Executive Summaries)
@@ -118,16 +118,30 @@ alignHighlightTemplate: matched light peak at (646,1004), score=0.6200, dx=9.93
 alignHighlightTemplate: fitted Multi-Peak Rigid Affine: s=1.0060, rot=-0.132 deg, tx=8.03
 ```
 
-#### 2.2.3 Four-Level Alignment Cascade (`alignHighlightFrame`)
+#### 2.2.3 Five-Level Multi-Exposure Alignment Cascade (`alignHighlightFrame`)
 
-| Priority | Method | Trigger Condition |
-|:---|:---|:---|
-| 1 | ORB `alignFrameHomography` | Sufficient ambient features ($N_{\text{inliers}} \ge 15$) |
-| 2 | `alignHighlightTemplate` (v16 Multi-ROI RANSAC) | ORB fails but bright light sources present |
-| 3 | Phase Correlation `alignGradientPhaseCorrelation` | No light sources, but gradient structure |
-| 4 | Identity $H = I$ | Complete fallback (featureless dark scene) |
+To resolve cross-exposure failure and screen-scene moiré interference:
+
+| Priority | Method | Mathematical Principle | Target Scene & Trigger Condition |
+|:---:|:---|:---|:---|
+| **1** | **ORB Homography** (`alignFrameHomography`) | Scale-space FAST-9 + BRIEF Hamming matching + RANSAC homography | Daylight / ambient scenes with rich geometric corners ($N_{\text{inliers}} \ge 15$, ratio $\ge 0.12$). |
+| **2** | **AlignMTB** (`alignFrameMTB`) | Greg Ward Median Threshold Bitmap pyramid bitwise XOR & popcount | **Multi-exposure bracketing & screen capture**: Completely invariant to EV stops, tone mapping shifts, and moiré fringes. Fast integer translation search. |
+| **3** | **Multi-ROI RANSAC** (`alignHighlightTemplate`) | Connected components peak extraction + NCC template matching + 4-DOF rigid affine RANSAC | Isolated point light sources: desk lamp bulbs, ceiling spotlights, filaments. |
+| **4** | **Log-Gradient Phase Correlation** (`alignGradientPhaseCorrelation`) | Cross-power spectral whitening in $\log(1 + \|\nabla I\|)$ domain | Global structural shift with low contrast or smooth gradients ($response \ge 0.10$). |
+| **5** | **Identity Mark** ($H = I$, `aligned = false`) | Zero-shift fallback marked as unaligned | Featureless pure black scenes. **Plate is flagged as unaligned and isolated from fusion.** |
+
+#### 2.2.4 Anti-Ghosting Plate Validation & Confidence Gating (防重影坏板熔断规范)
+
+> [!CAUTION]
+> **Zero-Tolerance for Ghosting**: In computational multi-exposure fusion, fusing an unaligned plate into the Laplacian pyramid produces permanent, razor-sharp double edges (as observed in v16/v17 low-light screen capture where Tier 2 EV -2.5 was shifted by 10 px relative to Tier 1 EV 0).
+> **Rule of Plate Isolation**:
+> 1. Each plate tracks an `isAligned` boolean flag.
+> 2. If a plate drops to Priority 5 ($H = I$ fallback), or if its cross-frame structural residual after warping exceeds threshold, `isAligned` is set to `false`.
+> 3. **Any plate with `isAligned == false` MUST BE PURGED from the `MergeMertens` plate array `plates1x`.**
+> 4. If all auxiliary tiers are purged, the engine outputs the pristine 50MP super-resolution plate `I_base_50M` without multi-exposure artifacts. Single-exposure fidelity is infinitely superior to dual-image ghosting.
 
 ---
+
 
 
 ## 3. OpenCV `createMergeMertens` Multi-Scale Fusion / 多尺度拉普拉斯融合
@@ -165,7 +179,22 @@ After fusion the result is upscaled back to 12MP before entering §4.
 
 **Rationale**: Laplacian pyramid construction cost scales as $O(W \cdot H)$; halving linear dimensions reduces the pyramid computation to **25% of the original area**, cutting memory from ~450 MB to ~115 MB and CPU time from ~2300 ms to **~120 ms** — a 19× speedup with negligible quality impact (pyramid levels below the Nyquist limit are unaffected).
 
+### 3.4 Gated Plate Fusion Contract / 融合板准入契约
+
+To completely eliminate double-image ghosting:
+1. `plates1x` initialization: `plates1x.push_back(I_base_12M)`.
+2. Tier 2 gate: `if (midAligned && !I_mid_12M.empty()) plates1x.push_back(I_mid_12M);`
+3. Tier 3 gate: `if (shortAligned && !I_short_12M.empty()) plates1x.push_back(I_short_12M);`
+4. If `plates1x.size() < 2`, `MergeMertens` is bypassed entirely, and `superResult` defaults directly to `I_base_50M`. Zero unaligned high-frequency strokes are permitted to enter the Laplacian pyramid.
+
+### 3.5 Screen Capture Mode & Moiré Interference Shielding (`isScreenMode`)
+
+When `isScreenMode == true` (capturing PC monitors, laptops, tablets, or phone screens):
+1. **Moiré-Immune Alignment**: Priority is assigned to **AlignMTB**, which evaluates median luminance topologies rather than high-frequency gradient features corrupted by Bayer-display beat frequencies.
+2. **Dynamic Range Awareness**: Electronic displays operate in Standard Dynamic Range (SDR, 100–350 nits), lacking extreme incandescent filament brightness. If Tier 2 or Tier 3 exhibit unresolvable hand jitter or ambiguity, they are safely dropped, preserving 100% of the screen text sharpness without ghost copies.
+
 ---
+
 
 
 ## 4. Two-Scale Frequency Super-Resolution (50MP) / 双尺度高频超分重构

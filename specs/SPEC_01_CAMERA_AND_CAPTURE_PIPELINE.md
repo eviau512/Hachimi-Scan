@@ -12,7 +12,7 @@
 
 The camera subsystem coordinates device optical sensors, hardware Image Signal Processors (ISP), Optical Image Stabilization (OIS), and user metering interactions. It exposes two deterministic capture modes:
 1. **Normal Mode**: Single-shot low-latency capture with hardware ISP high-quality enhancement and OIS enabled.
-2. **Full HDR Unified Mode**: A 4-frame exposure-bracketed and sub-pixel burst capturing high-frequency scene radiance and micro-motion for 50MP super-resolution fusion and tone mapping.
+2. **Full HDR Unified Mode**: A 7-frame multi-tier exposure pyramid burst (4 EV 0 + 2 EV -2.5 + 1 EV -6.0) capturing high-frequency scene radiance and micro-motion for 50MP super-resolution fusion, highlight recovery, and cinema-grade tone mapping.
 
 ---
 
@@ -59,22 +59,22 @@ To ensure that burst captures occur when hand jitter is minimal:
    - If $\sigma_{\text{pos}} < 3.5\,\text{pixels}$, the system transitions to `isStable = true`.
    - The shutter button indicator displays an animated green ring.
 3. **Burst Synchronization**:
-   When the user initiates a Full HDR capture, the pipeline waits up to 1500 ms for `isStable == true` before latching the first frame.
+   When the user initiates a Full HDR capture, the pipeline waits up to 400 ms (`withTimeoutOrNull(400L)`) for `isStable == true` before latching the first frame, ensuring instant tactile responsiveness without shutter lag.
 
 ---
 
-## 5. Apple Deep Fusion / Smart HDR 9-Frame Unified Capture Pipeline / 9帧曝光金字塔连拍管线
+## 5. Apple Deep Fusion / Smart HDR 7-Frame Unified Capture Pipeline / 7帧曝光金字塔连拍管线
 
 ### 5.1 The Frame Sequence & Exposure Contract
-To achieve wide dynamic range and super-resolution without severe exposure cliffs or AE hunting oscillation, the pipeline implements an **Apple Deep Fusion / Smart HDR 9-frame capture pyramid** structured into 3 exposure tiers:
+To achieve wide dynamic range and super-resolution without severe exposure cliffs or AE hunting oscillation, the pipeline implements an **Apple Deep Fusion / Smart HDR 7-frame capture pyramid** structured into 3 exposure tiers:
 
-| Frame Range | Tier & Exposure | Camera Control Mode | Functional Purpose |
-|:---:|:---:|:---:|:---|
-| **Frames 0–3** | **Tier 1 (EV 0 Base)** | Active AE Locked (No 3A reset) | Sub-pixel super-resolution anchors, temporal denoise ($1/\sqrt{4}$ SNR boost), geometric reference. |
-| **Frames 4–6** | **Tier 2 (EV -2.5 Mid)** | Manual (`CONTROL_AE_MODE_OFF`) | Smooth midtone transition, prevents glare blowout, preserves room and wall illumination tones. |
-| **Frames 7–8** | **Tier 3 (EV -5.0 Short)** | Manual (`CONTROL_AE_MODE_OFF`) | Extreme highlight recovery: lamp filaments, lightbulb markings, and specular un-saturation at ISO 100. |
+| Frame Range | Tier & Exposure | Camera Control Mode | Exposure Parameter Formula | Functional Purpose |
+|:---:|:---:|:---:|:---|:---|
+| **Frames 0–3** | **Tier 1 (EV 0 Base)** | Active AE Locked (No 3A reset) | Camera Auto-Exposure (`baseIso`, `baseExpSec`) | Sub-pixel super-resolution anchors, temporal denoise ($1/\sqrt{4}$ SNR boost), geometric reference. |
+| **Frames 4–5** | **Tier 2 (EV -2.5 Mid)** | Manual (`CONTROL_AE_MODE_OFF`) | $\text{midIso} = \text{clamp}(\text{baseIso}/4,\ 100,\ 3200)$<br>$\text{midExpSec} = \text{clamp}(\text{baseExpSec}/3,\ 1/2000,\ 1/30)$ | Smooth midtone transition, prevents glare blowout, preserves room and wall illumination tones. |
+| **Frame 6** | **Tier 3 (EV -6.0 Short)** | Manual (`CONTROL_AE_MODE_OFF`) | $\text{shortIso} = \text{clamp}(\text{midIso}/8,\ 100,\ 800)$<br>$\text{shortExpSec} = \text{clamp}(\text{midExpSec}/4,\ 1/4000,\ 1/250)$ | Extreme highlight recovery: lamp filaments, lightbulb markings, and specular un-saturation. |
 
-### 5.2 9-Frame Exposure Sequence Diagram
+### 5.2 7-Frame Exposure Sequence Diagram
 ```mermaid
 sequenceDiagram
     participant VM as CameraViewModel
@@ -82,21 +82,21 @@ sequenceDiagram
     participant S as CMOS Sensor & ISP
     participant Storage as Cache Storage
 
-    Note over VM,S: Tier 1: 4 Frames at EV 0 (Base AE)
+    Note over VM,S: Tier 1: 4 Frames at EV 0 (Base AE Locked)
     VM->>S: 1. takeSinglePicture() x 4 (Frames 0, 1, 2, 3)
     S-->>Storage: Tier 1 JPEGs (Base ISO, Base Exp)
     VM->>VM: Inspect Frame 0 EXIF (baseIso, baseExpSec)
 
-    Note over VM,S: Tier 2: 3 Frames at EV -2.5 (Midtone Transition)
-    VM->>C2: setCaptureRequestOptions(midExp, midIso)
-    VM->>VM: delay(80ms) for sensor register latching
-    VM->>S: 2. takeSinglePicture() x 3 (Frames 4, 5, 6)
+    Note over VM,S: Tier 2: 2 Frames at EV -2.5 (Midtone Transition)
+    VM->>C2: setCaptureRequestOptions(midExpNanos, midIso)
+    VM->>VM: delay(40ms) for sensor register latching
+    VM->>S: 2. takeSinglePicture() x 2 (Frames 4, 5)
     S-->>Storage: Tier 2 JPEGs
 
-    Note over VM,S: Tier 3: 2 Frames at EV -5.0 (Deep Highlight Recovery)
-    VM->>C2: setCaptureRequestOptions(shortExp, shortIso=100)
-    VM->>VM: delay(80ms) for sensor register latching
-    VM->>S: 3. takeSinglePicture() x 2 (Frames 7, 8)
+    Note over VM,S: Tier 3: 1 Frame at EV -6.0 (Deep Highlight Recovery)
+    VM->>C2: setCaptureRequestOptions(shortExpNanos, shortIso)
+    VM->>VM: delay(40ms) for sensor register latching
+    VM->>S: 3. takeSinglePicture() x 1 (Frame 6)
     S-->>Storage: Tier 3 JPEGs
 
     VM->>C2: clearCaptureRequestOptions() (Restores AE)
