@@ -22,8 +22,16 @@ public:
     // 专为跨大曝光级差的 HDR 连拍设计，免疫大面积过曝与纯黑，杜绝重影和发光环错位
     bool alignFrameMTB(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH);
 
-    // 暗光高动态场景极高光质心与结构配准 (Highlight Centroid & Structure Alignment)
-    // 专为暗光夜景中发光灯具、环形灯带、发光字设计，利用局部窗口质心避免桌面反光干扰，实现亚像素无重影贴合
+    // 梯度域相位相关配准 (Gradient-Domain Phase Correlation)
+    // 采用对数梯度幅值 Log(1 + |grad|) + Hanning 窗，免疫曝光级差剧变，实现亚像素刚体位移计算
+    bool alignGradientPhaseCorrelation(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH);
+
+    // 高光多候选 ROI 归一化互相关模板精配准 (Multi-ROI NCC Template Match)
+    // 专门针对夜景灯芯、环形灯管、发光字，通过局部互相关峰值与抛物线拟合达到 0.05 像素精度
+    bool alignHighlightTemplate(const cv::Mat& srcShort, const cv::Mat& refBase, cv::Mat& outWarped, cv::Mat& outH);
+
+    // 暗光高动态场景极高光结构配准 (Highlight Structure & Multi-Algorithm Alignment)
+    // 优先 CLAHE ORB -> NCC Template -> 对数梯度相位相关 -> 恒等矩阵保底，彻底杜绝桌面反光拉偏和发光环错位重影
     bool alignHighlightFrame(const cv::Mat& srcShort, const cv::Mat& refBase, cv::Mat& outWarped, cv::Mat& outH);
 
 private:

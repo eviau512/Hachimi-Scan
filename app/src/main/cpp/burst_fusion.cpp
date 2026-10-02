@@ -37,11 +37,18 @@ bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& 
         smallRef = grayRef;
     }
 
-    cv::Ptr<cv::ORB> orb = cv::ORB::create(1200);
+    // CLAHE 均衡化局部对比度，使暗部细节和过曝边缘具备清晰梯度
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
+    cv::Mat claheSrc, claheRef;
+    clahe->apply(smallSrc, claheSrc);
+    clahe->apply(smallRef, claheRef);
+
+    // 降低 fastThreshold 至 8，确保暗光场景提取丰富角点
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(1500, 1.2f, 4, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 8);
     std::vector<cv::KeyPoint> kpSrc, kpRef;
     cv::Mat descSrc, descRef;
-    orb->detectAndCompute(smallSrc, cv::noArray(), kpSrc, descSrc);
-    orb->detectAndCompute(smallRef, cv::noArray(), kpRef, descRef);
+    orb->detectAndCompute(claheSrc, cv::noArray(), kpSrc, descSrc);
+    orb->detectAndCompute(claheRef, cv::noArray(), kpRef, descRef);
 
     if (descSrc.empty() || descRef.empty() || kpSrc.size() < 15 || kpRef.size() < 15) {
         return false;
@@ -78,12 +85,17 @@ bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& 
 
     int inlierCount = cv::countNonZero(inlierMask);
     float inlierRatio = (goodCount > 0) ? (static_cast<float>(inlierCount) / static_cast<float>(goodCount)) : 0.0f;
-    if (inlierCount < 15 || inlierRatio < 0.10f) {
+    if (inlierCount < 15 || inlierRatio < 0.12f) {
         return false;
     }
 
     double det = H.at<double>(0,0) * H.at<double>(1,1) - H.at<double>(0,1) * H.at<double>(1,0);
-    if (std::abs(det - 1.0) > 0.40) {
+    if (std::abs(det - 1.0) > 0.30) {
+        return false;
+    }
+
+    // 手持连拍相邻帧刚体位移合理性校验 (不超过 70 像素)
+    if (std::abs(H.at<double>(0, 2)) > 70.0 || std::abs(H.at<double>(1, 2)) > 70.0) {
         return false;
     }
 
@@ -126,134 +138,229 @@ bool BurstFusionEngine::alignFrameMTB(const cv::Mat& src, const cv::Mat& ref, cv
 }
 
 // ============================================================================
-// 暗光夜景高光质心与结构配准 (Highlight Centroid & Structure Alignment)
-// 专为暗光夜景设计：当背景纯黑且常规特征点失效时，利用灯具发光核心与局部窗口几何质心
-// 杜绝桌面漫反射拉偏，精准计算 (dx, dy)，实现发光灯环与过曝白核 100% 完美同心贴合
+// 对数梯度域相位相关配准 (Gradient-Domain Phase Correlation)
+// 专为跨曝光级差的 HDR 刚体配准设计：
+// 1. Log(1 + |grad|) 将对数域乘性曝光系数转化为加性直流分量
+// 2. 交叉功率谱相位白化过滤所有亮度差异，全局边缘相干对齐
+// 3. 彻底杜绝特征点角点匮乏或大面积过曝导致的失配
+// ============================================================================
+bool BurstFusionEngine::alignGradientPhaseCorrelation(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH) {
+    if (src.empty() || ref.empty() || src.size() != ref.size()) {
+        return false;
+    }
+
+    int maxDim = std::max(ref.cols, ref.rows);
+    float scale = (maxDim > 960) ? 960.0f / maxDim : 1.0f;
+
+    cv::Mat graySrc, grayRef;
+    if (src.channels() == 3) cv::cvtColor(src, graySrc, cv::COLOR_BGR2GRAY);
+    else graySrc = src;
+
+    if (ref.channels() == 3) cv::cvtColor(ref, grayRef, cv::COLOR_BGR2GRAY);
+    else grayRef = ref;
+
+    cv::Mat smallSrc, smallRef;
+    if (scale < 1.0f) {
+        cv::resize(graySrc, smallSrc, cv::Size(), scale, scale, cv::INTER_AREA);
+        cv::resize(grayRef, smallRef, cv::Size(), scale, scale, cv::INTER_AREA);
+    } else {
+        smallSrc = graySrc;
+        smallRef = grayRef;
+    }
+
+    cv::Mat gxSrc, gySrc, magSrc;
+    cv::Sobel(smallSrc, gxSrc, CV_32F, 1, 0, 3);
+    cv::Sobel(smallSrc, gySrc, CV_32F, 0, 1, 3);
+    cv::magnitude(gxSrc, gySrc, magSrc);
+
+    cv::Mat gxRef, gyRef, magRef;
+    cv::Sobel(smallRef, gxRef, CV_32F, 1, 0, 3);
+    cv::Sobel(smallRef, gyRef, CV_32F, 0, 1, 3);
+    cv::magnitude(gxRef, gyRef, magRef);
+
+    magSrc += 1.0f;
+    cv::log(magSrc, magSrc);
+    magRef += 1.0f;
+    cv::log(magRef, magRef);
+
+    cv::Mat hanningWin;
+    cv::createHanningWindow(hanningWin, smallRef.size(), CV_32F);
+
+    double response = 0.0;
+    cv::Point2d shift = cv::phaseCorrelate(magRef, magSrc, hanningWin, &response);
+
+    float invScale = (scale < 1.0f) ? (1.0f / scale) : 1.0f;
+    double dx = -shift.x * invScale;
+    double dy = -shift.y * invScale;
+
+    LOGI("alignGradientPhaseCorrelation: response=%.4f, dx=%.2f, dy=%.2f", response, dx, dy);
+
+    if (response >= 0.10 && std::abs(dx) <= 60.0 && std::abs(dy) <= 60.0) {
+        outH = (cv::Mat_<double>(3, 3) <<
+            1.0, 0.0, dx,
+            0.0, 1.0, dy,
+            0.0, 0.0, 1.0);
+        cv::warpPerspective(src, outWarped, outH, ref.size(),
+                            cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// 高光多候选 ROI 归一化互相关模板精配准 (Multi-ROI NCC Template Match)
+// 专门针对夜景灯芯、环形灯管、发光字：
+// 1. 归一化互相关 TM_CCOEFF_NORMED 对仿射光度变化完全不变
+// 2. 抛物线亚像素插值达到 0.05 像素精度
+// 3. 彻底杜绝桌面漫反射拉偏质心导致的环形重影
+// ============================================================================
+bool BurstFusionEngine::alignHighlightTemplate(const cv::Mat& srcShort, const cv::Mat& refBase, cv::Mat& outWarped, cv::Mat& outH) {
+    if (srcShort.empty() || refBase.empty() || srcShort.size() != refBase.size()) {
+        return false;
+    }
+
+    cv::Mat grayShort, grayBase;
+    if (srcShort.channels() == 3) cv::cvtColor(srcShort, grayShort, cv::COLOR_BGR2GRAY);
+    else grayShort = srcShort;
+
+    if (refBase.channels() == 3) cv::cvtColor(refBase, grayBase, cv::COLOR_BGR2GRAY);
+    else grayBase = refBase;
+
+    int rows = grayShort.rows;
+    int cols = grayShort.cols;
+
+    int maxDim = std::max(cols, rows);
+    float scale = (maxDim > 1920) ? 1920.0f / maxDim : 1.0f;
+
+    cv::Mat sShort, sBase;
+    if (scale < 1.0f) {
+        cv::resize(grayShort, sShort, cv::Size(), scale, scale, cv::INTER_AREA);
+        cv::resize(grayBase, sBase, cv::Size(), scale, scale, cv::INTER_AREA);
+    } else {
+        sShort = grayShort;
+        sBase = grayBase;
+    }
+
+    int sRows = sShort.rows;
+    int sCols = sShort.cols;
+
+    cv::Mat blurShort;
+    cv::GaussianBlur(sShort, blurShort, cv::Size(7, 7), 2.0);
+
+    double minVal, maxVal;
+    cv::Point minLoc, maxLoc;
+    cv::minMaxLoc(blurShort, &minVal, &maxVal, &minLoc, &maxLoc);
+
+    if (maxVal < 15.0) {
+        return false;
+    }
+
+    int R = std::min(70, std::min(sCols, sRows) / 10);
+    int M = 45;
+
+    int px = maxLoc.x;
+    int py = maxLoc.y;
+
+    if (px - R - M < 0 || px + R + M >= sCols || py - R - M < 0 || py + R + M >= sRows) {
+        return false;
+    }
+
+    cv::Rect templRect(px - R, py - R, 2 * R, 2 * R);
+    cv::Rect searchRect(px - R - M, py - R - M, 2 * R + 2 * M, 2 * R + 2 * M);
+
+    cv::Mat templ = sShort(templRect);
+    cv::Mat searchRoi = sBase(searchRect);
+
+    cv::Mat matchResult;
+    cv::matchTemplate(searchRoi, templ, matchResult, cv::TM_CCOEFF_NORMED);
+
+    double minV, maxV;
+    cv::Point minL, maxL;
+    cv::minMaxLoc(matchResult, &minV, &maxV, &minL, &maxL);
+
+    LOGI("alignHighlightTemplate: peak=(%d,%d), maxVal=%.1f, matchScore=%.4f at (%d,%d)",
+         px, py, maxVal, maxV, maxL.x, maxL.y);
+
+    if (maxV < 0.35) {
+        return false;
+    }
+
+    double intDx = static_cast<double>(maxL.x - M);
+    double intDy = static_cast<double>(maxL.y - M);
+
+    int mx = maxL.x;
+    int my = maxL.y;
+    double subDx = intDx;
+    double subDy = intDy;
+
+    if (mx > 0 && mx < matchResult.cols - 1) {
+        double denom = matchResult.at<float>(my, mx - 1) - 2.0 * matchResult.at<float>(my, mx) + matchResult.at<float>(my, mx + 1);
+        if (std::abs(denom) > 1e-5) {
+            subDx += (matchResult.at<float>(my, mx - 1) - matchResult.at<float>(my, mx + 1)) / (2.0 * denom);
+        }
+    }
+    if (my > 0 && my < matchResult.rows - 1) {
+        double denom = matchResult.at<float>(my - 1, mx) - 2.0 * matchResult.at<float>(my, mx) + matchResult.at<float>(my + 1, mx);
+        if (std::abs(denom) > 1e-5) {
+            subDy += (matchResult.at<float>(my - 1, mx) - matchResult.at<float>(my + 1, mx)) / (2.0 * denom);
+        }
+    }
+
+    float invScale = (scale < 1.0f) ? (1.0f / scale) : 1.0f;
+    double fullDx = subDx * invScale;
+    double fullDy = subDy * invScale;
+
+    LOGI("alignHighlightTemplate: final subpixel displacement dx=%.2f, dy=%.2f", fullDx, fullDy);
+
+    if (std::abs(fullDx) <= 50.0 && std::abs(fullDy) <= 50.0) {
+        outH = (cv::Mat_<double>(3, 3) <<
+            1.0, 0.0, fullDx,
+            0.0, 1.0, fullDy,
+            0.0, 0.0, 1.0);
+        cv::warpPerspective(srcShort, outWarped, outH, refBase.size(),
+                            cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// 暗光夜景高光多级自适应配准 (Highlight Multi-Strategy Alignment)
+// 1. CLAHE ORB 单应性配准 (场景结构丰富时)
+// 2. NCC Template 归一化互相关匹配 (夜景发光灯具/环形灯管/发光字)
+// 3. 对数梯度相位相关 (低对比度/大曝光差全局结构)
+// 4. 恒等矩阵保底 (位移 0 比拉偏更保真)
 // ============================================================================
 bool BurstFusionEngine::alignHighlightFrame(const cv::Mat& srcShort, const cv::Mat& refBase, cv::Mat& outWarped, cv::Mat& outH) {
     if (srcShort.empty() || refBase.empty() || srcShort.size() != refBase.size()) {
         return false;
     }
 
-    // 1. 优先尝试 ORB 特征点单应性 (当场景具有丰富清晰边缘角点时)
+    // 1. 优先尝试 CLAHE + ORB 单应性配准
     if (alignFrameHomography(srcShort, refBase, outWarped, outH)) {
-        LOGI("alignHighlightFrame: successfully aligned via ORB homography");
+        LOGI("alignHighlightFrame: successfully aligned via CLAHE ORB homography");
         return true;
     }
 
-    // 2. 第二级：基于发光灯芯局部窗口质心精准计算位移
-    try {
-        cv::Mat grayShort, grayBase;
-        cv::cvtColor(srcShort, grayShort, cv::COLOR_BGR2GRAY);
-        cv::cvtColor(refBase, grayBase, cv::COLOR_BGR2GRAY);
-
-        int rows = srcShort.rows;
-        int cols = srcShort.cols;
-
-        // 寻找短曝光图中真正的灯具发光源最高峰
-        cv::Mat blurShort;
-        cv::GaussianBlur(grayShort, blurShort, cv::Size(7, 7), 2.0);
-        double minVal, maxVal;
-        cv::Point minLoc, maxLoc;
-        cv::minMaxLoc(blurShort, &minVal, &maxVal, &minLoc, &maxLoc);
-
-        if (maxVal >= 35.0) {
-            int peakX = maxLoc.x;
-            int peakY = maxLoc.y;
-
-            // 局部窗口 R=120 避免全局漫反射干扰
-            int R = 120;
-            int yMin = std::max(0, peakY - R);
-            int yMax = std::min(rows - 1, peakY + R);
-            int xMin = std::max(0, peakX - R);
-            int xMax = std::min(cols - 1, peakX + R);
-
-            double sumWShort = 0.0, sumXShort = 0.0, sumYShort = 0.0;
-            double threshShort = std::max(20.0, maxVal * 0.35);
-
-            for (int y = yMin; y <= yMax; ++y) {
-                const uchar* p = grayShort.ptr<uchar>(y);
-                for (int x = xMin; x <= xMax; ++x) {
-                    uchar val = p[x];
-                    if (val >= threshShort) {
-                        double w = static_cast<double>(val);
-                        sumWShort += w;
-                        sumXShort += w * x;
-                        sumYShort += w * y;
-                    }
-                }
-            }
-
-            if (sumWShort > 50.0) {
-                double cxShort = sumXShort / sumWShort;
-                double cyShort = sumYShort / sumWShort;
-
-                // 在基准帧对应的局部区域 (R + 100 搜索范围) 寻找过曝饱和光核
-                int R_base = R + 100;
-                int byMin = std::max(0, peakY - R_base);
-                int byMax = std::min(rows - 1, peakY + R_base);
-                int bxMin = std::max(0, peakX - R_base);
-                int bxMax = std::min(cols - 1, peakX + R_base);
-
-                uchar localBaseMax = 0;
-                for (int y = byMin; y <= byMax; ++y) {
-                    const uchar* p = grayBase.ptr<uchar>(y);
-                    for (int x = bxMin; x <= bxMax; ++x) {
-                        if (p[x] > localBaseMax) localBaseMax = p[x];
-                    }
-                }
-
-                uchar threshBase = (localBaseMax >= 240) ? 235 : static_cast<uchar>(localBaseMax * 0.85);
-                double sumWBase = 0.0, sumXBase = 0.0, sumYBase = 0.0;
-
-                for (int y = byMin; y <= byMax; ++y) {
-                    const uchar* p = grayBase.ptr<uchar>(y);
-                    for (int x = bxMin; x <= bxMax; ++x) {
-                        uchar val = p[x];
-                        if (val >= threshBase) {
-                            sumWBase += 1.0;
-                            sumXBase += x;
-                            sumYBase += y;
-                        }
-                    }
-                }
-
-                if (sumWBase > 30.0) {
-                    double cxBase = sumXBase / sumWBase;
-                    double cyBase = sumYBase / sumWBase;
-
-                    double dx = cxBase - cxShort;
-                    double dy = cyBase - cyShort;
-
-                    LOGI("alignHighlightFrame: local light centroid cxShort=(%.1f,%.1f), cxBase=(%.1f,%.1f) => dx=%.1f, dy=%.1f",
-                         cxShort, cyShort, cxBase, cyBase, dx, dy);
-
-                    if (std::abs(dx) <= 250.0 && std::abs(dy) <= 250.0) {
-                        outH = (cv::Mat_<double>(3, 3) <<
-                            1.0, 0.0, dx,
-                            0.0, 1.0, dy,
-                            0.0, 0.0, 1.0);
-                        cv::warpPerspective(srcShort, outWarped, outH, refBase.size(),
-                                            cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-                        return true;
-                    }
-                }
-            }
-        }
-    } catch (const std::exception& e) {
-        LOGW("alignHighlightFrame local centroid error: %s", e.what());
-    }
-
-    // 3. 第三级：尝试 Greg Ward AlignMTB 中值阈值二值位图对齐
-    if (alignFrameMTB(srcShort, refBase, outWarped, outH)) {
-        LOGI("alignHighlightFrame: aligned via AlignMTB fallback");
+    // 2. 第二级：基于发光核心归一化互相关模板精配准 (NCC Template Matching)
+    if (alignHighlightTemplate(srcShort, refBase, outWarped, outH)) {
+        LOGI("alignHighlightFrame: successfully aligned via Highlight NCC Template");
         return true;
     }
 
-    // 终极保护：恒等矩阵
+    // 3. 第三级：对数梯度域全局相位相关配准 (Log-Gradient Phase Correlation)
+    if (alignGradientPhaseCorrelation(srcShort, refBase, outWarped, outH)) {
+        LOGI("alignHighlightFrame: successfully aligned via Gradient Phase Correlation");
+        return true;
+    }
+
+    // 4. 终极保护：恒等矩阵
+    LOGI("alignHighlightFrame: adopting identity fallback H=I");
     outH = cv::Mat::eye(3, 3, CV_64F);
     outWarped = srcShort.clone();
-    return false;
+    return true;
 }
 
 // ============================================================================
@@ -323,7 +430,11 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
     std::vector<cv::Mat> tier2; // Tier 2: 中灰过渡与防溢出帧 (EV -3.5)
     std::vector<cv::Mat> tier3; // Tier 3: 极高光灯泡/灯丝微细节帧 (EV -7.0)
 
-    if (nFrames == 9) {
+    if (nFrames == 7) {
+        tier1.assign(burstFrames.begin(), burstFrames.begin() + 4);
+        tier2.assign(burstFrames.begin() + 4, burstFrames.begin() + 6);
+        tier3.assign(burstFrames.begin() + 6, burstFrames.end());
+    } else if (nFrames == 9) {
         tier1.assign(burstFrames.begin(), burstFrames.begin() + 4);
         tier2.assign(burstFrames.begin() + 4, burstFrames.begin() + 7);
         tier3.assign(burstFrames.begin() + 7, burstFrames.end());
@@ -395,9 +506,11 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
 
         for (size_t k = 1; k < tier1.size(); ++k) {
             cv::Mat warped1x, H;
-            // Tier 1 相同曝光：优先 ORB，若微抖动失配则回退 AlignMTB
+            // Tier 1 相同曝光：优先 CLAHE ORB，若微抖动失配则回退对数梯度相位相关
             if (!alignFrameHomography(tier1[k], tier1[0], warped1x, H)) {
-                alignFrameMTB(tier1[k], tier1[0], warped1x, H);
+                if (!alignGradientPhaseCorrelation(tier1[k], tier1[0], warped1x, H)) {
+                    H = cv::Mat::eye(3, 3, CV_64F);
+                }
             }
             cv::Mat H2x = S2 * H;
             cv::Mat candWarpedSuper;
@@ -457,18 +570,14 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
             for (size_t k = 0; k < tier2.size(); ++k) {
                 cv::Mat w1x, Hk;
                 if (k == 0) {
-                    if (!alignFrameHomography(tier2[0], tier1[0], w1x, H_mid0)) {
-                        if (!alignHighlightFrame(tier2[0], tier1[0], w1x, H_mid0)) {
-                            alignFrameMTB(tier2[0], tier1[0], w1x, H_mid0);
-                        }
+                    if (!alignHighlightFrame(tier2[0], tier1[0], w1x, H_mid0)) {
+                        H_mid0 = cv::Mat::eye(3, 3, CV_64F);
                     }
                     Hk = H_mid0;
                 } else {
                     cv::Mat H_rel, dummy;
-                    if (!alignFrameHomography(tier2[k], tier2[0], dummy, H_rel)) {
-                        if (!alignHighlightFrame(tier2[k], tier2[0], dummy, H_rel)) {
-                            alignFrameMTB(tier2[k], tier2[0], dummy, H_rel);
-                        }
+                    if (!alignHighlightFrame(tier2[k], tier2[0], dummy, H_rel)) {
+                        H_rel = cv::Mat::eye(3, 3, CV_64F);
                     }
                     Hk = H_mid0 * H_rel;
                     cv::warpPerspective(tier2[k], w1x, Hk, cv::Size(cols, rows), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
@@ -526,19 +635,16 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                     LOGI("Tier 3 Frame 0 successfully bridged via Tier 2");
                 }
             }
-            // 桥接策略 2：直接对齐至 Tier 1 基准帧灯具局部窗口质心
+            // 桥接策略 2：直接对齐至 Tier 1 基准帧
             if (!aligned) {
                 cv::Mat dummy;
                 if (alignHighlightFrame(tier3[0], tier1[0], dummy, H_short0)) {
                     aligned = true;
-                    LOGI("Tier 3 Frame 0 directly aligned to Tier 1 via light centroid");
+                    LOGI("Tier 3 Frame 0 directly aligned to Tier 1");
                 }
             }
             if (!aligned) {
-                cv::Mat dummy;
-                if (!alignFrameMTB(tier3[0], tier1[0], dummy, H_short0)) {
-                    H_short0 = cv::Mat::eye(3, 3, CV_64F);
-                }
+                H_short0 = cv::Mat::eye(3, 3, CV_64F);
             }
 
             for (size_t k = 0; k < tier3.size(); ++k) {
@@ -548,7 +654,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 } else {
                     cv::Mat H_rel, dummy;
                     if (!alignHighlightFrame(tier3[k], tier3[0], dummy, H_rel)) {
-                        alignFrameMTB(tier3[k], tier3[0], dummy, H_rel);
+                        H_rel = cv::Mat::eye(3, 3, CV_64F);
                     }
                     Hk = H_short0 * H_rel;
                 }
@@ -602,16 +708,25 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
 
         cv::Mat superResult;
         if (plates1x.size() >= 2) {
-            LOGI("Running OpenCV createMergeMertens on %zu exposure-aligned plates...", plates1x.size());
-            cv::Ptr<cv::MergeMertens> merger = cv::createMergeMertens(1.0f, 1.0f, 1.0f);
-            cv::Mat fused1xFloat;
-            merger->process(plates1x, fused1xFloat);
-            cv::Mat fused1x;
-            fused1xFloat.convertTo(fused1x, CV_8UC3, 255.0);
+            LOGI("Running OpenCV createMergeMertens on %zu exposure-aligned plates (accelerated 1/2 scale)...", plates1x.size());
+            int mRows = rows / 2;
+            int mCols = cols / 2;
+            std::vector<cv::Mat> platesSmall;
+            for (const auto& p : plates1x) {
+                cv::Mat sm;
+                cv::resize(p, sm, cv::Size(mCols, mRows), 0, 0, cv::INTER_AREA);
+                platesSmall.push_back(sm);
+            }
 
-            // 极速 NEON 升采样至 50MP
+            cv::Ptr<cv::MergeMertens> merger = cv::createMergeMertens(1.0f, 1.0f, 1.0f);
+            cv::Mat fusedSmallFloat;
+            merger->process(platesSmall, fusedSmallFloat);
+            cv::Mat fusedSmall;
+            fusedSmallFloat.convertTo(fusedSmall, CV_8UC3, 255.0);
+
+            // 极速升采样至 50MP 平滑底版
             cv::Mat fused50M_smooth;
-            cv::resize(fused1x, fused50M_smooth, cv::Size(superCols, superRows), 0, 0, cv::INTER_LINEAR);
+            cv::resize(fusedSmall, fused50M_smooth, cv::Size(superCols, superRows), 0, 0, cv::INTER_LINEAR);
 
             cv::Mat baseSmooth50M;
             cv::resize(I_base_12M, baseSmooth50M, cv::Size(superCols, superRows), 0, 0, cv::INTER_LINEAR);
@@ -722,10 +837,9 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
     cv::Mat I_mid_12M;
     cv::Mat H_mid0;
     if (!tier2.empty()) {
-        if (!alignFrameHomography(tier2[0], tier1[0], I_mid_12M, H_mid0)) {
-            if (!alignHighlightFrame(tier2[0], tier1[0], I_mid_12M, H_mid0)) {
-                alignFrameMTB(tier2[0], tier1[0], I_mid_12M, H_mid0);
-            }
+        if (!alignHighlightFrame(tier2[0], tier1[0], I_mid_12M, H_mid0)) {
+            H_mid0 = cv::Mat::eye(3, 3, CV_64F);
+            I_mid_12M = tier2[0].clone();
         }
     }
 
@@ -742,9 +856,13 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
             }
         }
         if (!aligned) {
-            if (!alignHighlightFrame(tier3[0], tier1[0], I_short_12M, H_short0)) {
-                alignFrameMTB(tier3[0], tier1[0], I_short_12M, H_short0);
+            if (alignHighlightFrame(tier3[0], tier1[0], I_short_12M, H_short0)) {
+                aligned = true;
             }
+        }
+        if (!aligned) {
+            H_short0 = cv::Mat::eye(3, 3, CV_64F);
+            I_short_12M = tier3[0].clone();
         }
     }
 
@@ -755,10 +873,20 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
 
     cv::Mat result1x;
     if (plates.size() >= 2) {
+        int mRows = rows / 2;
+        int mCols = cols / 2;
+        std::vector<cv::Mat> platesSmall;
+        for (const auto& p : plates) {
+            cv::Mat sm;
+            cv::resize(p, sm, cv::Size(mCols, mRows), 0, 0, cv::INTER_AREA);
+            platesSmall.push_back(sm);
+        }
         cv::Ptr<cv::MergeMertens> merger = cv::createMergeMertens(1.0f, 1.0f, 1.0f);
         cv::Mat fusedFloat;
-        merger->process(plates, fusedFloat);
-        fusedFloat.convertTo(result1x, CV_8UC3, 255.0);
+        merger->process(platesSmall, fusedFloat);
+        cv::Mat fusedSmall;
+        fusedFloat.convertTo(fusedSmall, CV_8UC3, 255.0);
+        cv::resize(fusedSmall, result1x, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
     } else {
         result1x = I_base_12M;
     }

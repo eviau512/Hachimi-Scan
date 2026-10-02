@@ -224,9 +224,9 @@ class CameraViewModel : ViewModel() {
             _isCapturing.value = true
             val control = cameraControl
             try {
-                // Wait for stable frame before burst (up to 1.5s)
+                // 快速手抖稳定性确认 (至多等待 400ms 避免卡顿)
                 if (!_isStable.value) {
-                    withTimeoutOrNull(1500L) {
+                    withTimeoutOrNull(400L) {
                         _isStable.first { it }
                     }
                 }
@@ -236,10 +236,8 @@ class CameraViewModel : ViewModel() {
                 val tier3Files = mutableListOf<File>()
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 1: 4 frames at normal AE (EV 0) — Base & Super-Res
-                // Consecutively captured under active AE without interrupting metering
+                // Tier 1: 4 帧正常曝光 (EV 0) — 50MP 亚像素超分与暗部降噪核心锚点
                 // ─────────────────────────────────────────────────────────────
-                // Tier 1: 4 frames at normal AE (EV 0) — Base & Super-Res (Parallel Burst Dispatch)
                 coroutineScope {
                     val t1Jobs = (0 until 4).map { i ->
                         val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t1_$i.jpg")
@@ -268,12 +266,12 @@ class CameraViewModel : ViewModel() {
                     baseExpSec = 0.033
                 }
 
-                // Tier 2 (-3.5 EV): Midtone Transition
+                // Tier 2 (-2.5 EV): Midtone Transition
                 val midIso = (baseIso / 4).coerceIn(100, 3200)
                 val midExpSec = (baseExpSec / 3.0).coerceIn(1.0 / 2000.0, 1.0 / 30.0)
                 val midExpNanos = (midExpSec * 1_000_000_000.0).toLong().coerceIn(500_000L, 33_333_333L)
 
-                // Tier 3 (-7.0 EV): Deep Highlight Recovery (Desk lamp bulb & filaments)
+                // Tier 3 (-6.0 EV): Deep Highlight Recovery (Desk lamp bulb & filaments)
                 val shortIso = (midIso / 8).coerceIn(100, 800)
                 val shortExpSec = (midExpSec / 4.0).coerceIn(1.0 / 4000.0, 1.0 / 250.0)
                 val shortExpNanos = (shortExpSec * 1_000_000_000.0).toLong().coerceIn(250_000L, 4_000_000L)
@@ -286,14 +284,14 @@ class CameraViewModel : ViewModel() {
                 )
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 2: 3 frames at Midtone Exposure (-2.5 EV, Parallel Burst Dispatch)
+                // Tier 2: 2 帧中灰曝光 (-2.5 EV) — 快速获取过渡中灰
                 // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     setManualCaptureOptions(control, context, midExpNanos, midIso)
-                    delay(50) // Sensor register latch
+                    delay(40) // Sensor register latch
                 }
                 coroutineScope {
-                    val t2Jobs = (0 until 3).map { i ->
+                    val t2Jobs = (0 until 2).map { i ->
                         val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t2_$i.jpg")
                         async {
                             if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
@@ -303,14 +301,14 @@ class CameraViewModel : ViewModel() {
                 }
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 3: 2 frames at Short Exposure (-5.0 EV, Parallel Burst Dispatch)
+                // Tier 3: 1 帧短曝光 (-6.0 EV) — 极速提取灯丝/灯芯与高光轮廓
                 // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     setManualCaptureOptions(control, context, shortExpNanos, shortIso)
-                    delay(50) // Sensor register latch
+                    delay(40) // Sensor register latch
                 }
                 coroutineScope {
-                    val t3Jobs = (0 until 2).map { i ->
+                    val t3Jobs = (0 until 1).map { i ->
                         val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t3_$i.jpg")
                         async {
                             if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
