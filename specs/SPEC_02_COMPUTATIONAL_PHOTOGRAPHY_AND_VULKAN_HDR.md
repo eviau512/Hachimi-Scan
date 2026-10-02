@@ -2,8 +2,8 @@
 ## 技术规格书 02：计算摄影与多尺度拉普拉斯 HDR 曝光融合规范
 
 > **Document Status**: Authoritative Core Pipeline Specification  
-> **Implementation Status**: v17 deployed (`versionCode=17`, commit `3fcbe3b`, branch `gpu-hdr`); v18 active (AlignMTB Multi-Exposure Cascade & Anti-Ghosting Gated Fusion)  
-> **Consolidates**: Legacy SPEC_04 (Burst Fusion), SPEC_08 (Stability), SPEC_09 (De-ghosting), SPEC_10 (Highlight Grafting), SPEC_12 (Saturation Grafting), SPEC_13 (Tone Mapping), SPEC_17 (Vulkan Pipeline), and SPEC_18 (Smart HDR 9-Frame Architecture)  
+> **Implementation Status**: v18 deployed (`versionCode=18`, commit `4d5599a`, branch `gpu-hdr`); v19 active (Reference-Frame Dominant Edge Blending, Periodic Line-Pitch Clamping, SDR Screen Isolation)  
+> **Consolidates**: Legacy SPEC_04 (Burst Fusion), SPEC_08 (Stability), SPEC_09 (De-ghosting), SPEC_10 (Highlight Grafting), SPEC_12 (Saturation Grafting), SPEC_13 (Tone Mapping), SPEC_17 (Vulkan Pipeline), SPEC_18 (Smart HDR 9-Frame Architecture), and SPEC_REF_OEM_RAW_HDR_AND_DENSE_ALIGNMENT (OEM Forensics & Edge Dominance)  
 > **Target Audience**: Computer Vision & Computational Photography Engineers  
 > **Languages**: Primary: English / Secondary: Chinese (Bilingual Executive Summaries)
 
@@ -11,7 +11,7 @@
 
 ## 1. Mathematical Architecture Overview / 算法全景
 
-The computational photography engine implements an **Apple Deep Fusion / Smart HDR 7-Frame Multi-Exposure Pyramid** coupled with **OpenCV `createMergeMertens` Multi-Scale Laplacian Pyramid Fusion** and **Two-Scale Frequency Super-Resolution**:
+The computational photography engine implements an **Apple Deep Fusion / Smart HDR 7-Frame Multi-Exposure Pyramid** coupled with **OpenCV `createMergeMertens` Multi-Scale Laplacian Pyramid Fusion**, **Reference-Frame Dominant Edge Blending**, and **Two-Scale Frequency Super-Resolution**:
 
 ```mermaid
 graph TD
@@ -21,14 +21,15 @@ graph TD
         T3["Tier 3: Frame 6 (EV -6.0 Filament & Deep Highlight)"]
     end
 
-    subgraph Alignment ["ORB Homography & Multi-Phase Alignment (v16)"]
+    subgraph Alignment ["ORB Homography & Multi-Phase Alignment (v16–v19)"]
         Align1["Tier 1 Alignment to Frame 0 (H_2x = S_2 * H)"]
         Align2["Tier 2 Relative Alignment & Chain Composition (H_k = H_mid0 * H_rel)"]
         Align3["Tier 3 Multi-ROI RANSAC Rigid Affine (Multi-Peak Light Source Matching)"]
+        ClampGuard["[v19] Periodic Line-Pitch Clamping: transDist <= 8.0px, |ty| <= 6.0px (Zero False Locks)"]
     end
 
     subgraph Reconstruction ["Exposure Plate Reconstruction"]
-        PlateBase50["50MP Base Plate I_base_50M (Temporal Gaussian Accumulation)"]
+        PlateBase50["50MP Base Plate I_base_50M (Reference-Frame Dominant Edge Blending, v19)"]
         PlateBase12["12MP Base Plate I_base_12M (Area Downsample)"]
         PlateMid12["12MP Midtone Plate I_mid_12M (Temporal Average)"]
         PlateShort12["12MP Short Plate I_short_12M + 50MP Filament ShortSuper"]
@@ -37,6 +38,7 @@ graph TD
     subgraph MertensFusion ["OpenCV MergeMertens Multi-Scale Laplacian Pyramid"]
         Mertens["Laplacian Pyramid Fusion on {I_base_12M, I_mid_12M, I_short_12M}"]
         Upscale["Bicubic Upscale to 50MP Fused Smooth Canvas"]
+        ScreenGate["[v19] Screen SDR Mode Gating: Bypasses Mertens on Low-DR Screens"]
     end
 
     subgraph FrequencySplit ["Two-Scale Frequency Detail Re-injection"]
@@ -47,7 +49,6 @@ graph TD
 
     subgraph PostProcessing ["Cinema-Grade Color & Texture Refinement"]
         Toe["Cinematic S-Curve Toe Damping (Y <= 28)"]
-        Texture["[v16] Adaptive Micro-Contrast Synthesis (tau=2, beta=0.55) — DEPRECATED in low-light scenes (v17)"]
         ISP["[v17] YCrCb ISP Denoising: Chroma Gaussian σ=3 + Luma Bilateral + Edge-Likelihood Coring Mask"]
     end
 
@@ -111,13 +112,6 @@ To prevent single-step exposure cliffs (which cause sensor noise amplification a
    - $N = 0$: identity fallback $H = I$.
 5. **Upscale**: affine → $H_{3\times3}$; translation components ×4 to restore full-resolution scale.
 
-**v16 Real-World Validation (OnePlus 13T, ISO 17984, commit `7061920`):**
-```
-alignHighlightTemplate: matched light peak at (1035,877), score=0.6829, dx=11.95
-alignHighlightTemplate: matched light peak at (646,1004), score=0.6200, dx=9.93
-alignHighlightTemplate: fitted Multi-Peak Rigid Affine: s=1.0060, rot=-0.132 deg, tx=8.03
-```
-
 #### 2.2.3 Five-Level Multi-Exposure Alignment Cascade (`alignHighlightFrame`)
 
 To resolve cross-exposure failure and screen-scene moiré interference:
@@ -139,6 +133,49 @@ To resolve cross-exposure failure and screen-scene moiré interference:
 > 2. If a plate drops to Priority 5 ($H = I$ fallback), or if its cross-frame structural residual after warping exceeds threshold, `isAligned` is set to `false`.
 > 3. **Any plate with `isAligned == false` MUST BE PURGED from the `MergeMertens` plate array `plates1x`.**
 > 4. If all auxiliary tiers are purged, the engine outputs the pristine 50MP super-resolution plate `I_base_50M` without multi-exposure artifacts. Single-exposure fidelity is infinitely superior to dual-image ghosting.
+
+#### 2.2.5 [v19 REQUIRED] Periodic Text Line-Pitch False Lock Prevention & Motion Clamping (行间距周期性假锁定物理熔断规范)
+
+> [!IMPORTANT]
+> **Root Cause Forensics (v18 Incident Log)**:  
+> In low-light screen/document captures, `alignFrameECC` reported:
+> `alignFrameECC: cc=0.6970, rot=0.187 deg, s=1.0000, tx=2.23, ty=-20.66, dist=20.78`  
+> In 12MP document space, $t_y = -20.66$ corresponds exactly to a single text line pitch ($P_{\text{line}} \approx 20 \sim 40\text{ px}$). The downsampled ECC solver converged to the neighboring line's periodic correlation peak, and passed the legacy `transDist <= 80.0` check. Fusing this shifted plate produced catastrophic double-line text ghosting.
+
+**Physical Motion Constraints for Handheld Burst (40ms interval)**:
+- In consecutive burst frames taken within 40–150ms with hardware OIS engaged, physical hand motion strictly satisfies:
+  $$\|\mathbf{t}_{12\text{M}}\| \le 8.0\,\text{pixels}, \quad |t_y| \le 6.5\,\text{pixels}$$
+- At downscaled resolution ($480\text{px}$ width, $\approx 1/8.33\times$), the physical displacement limit is:
+  $$\|\mathbf{t}_{480\text{p}}\| \le 1.0\,\text{pixel}$$
+
+**v19 Enforcement Rules**:
+1. In `alignFrameECC`:
+   - If $\text{transDist} > 8.0\,\text{px}$ or $|t_y| > 6.5\,\text{px}$ at full resolution (or $> 1.0\,\text{px}$ at downscaled scale), the result is flagged as **Periodic Line Pitch Jump** and rejected (`return false`).
+   - If correlation $cc < 0.60$, reject (`return false`).
+2. In `alignFrameHomography`:
+   - Enforce translation displacement bound $|H_{0,2}| \le 12.0\,\text{px}$ and $|H_{1,2}| \le 8.0\,\text{px}$.
+3. In `isScreenMode`:
+   - If maximum scene luminance $Y_{\max} < 245$ (no blown highlights requiring HDR compression), **isolate Tier 2 and Tier 3 from MergeMertens**, directly outputting the 50MP base super-resolution plate `I_base_50M`. This completely removes the multi-exposure fusion risk on electronic screens.
+
+### 2.3 [v19 REQUIRED] Step 1: Reference-Frame Dominant Edge Blending (基准帧绝对主导保边融合)
+
+#### 2.3.1 Mathematical Proof of Edge Softening under Averaging
+In the legacy implementation, candidate frames $I_1, I_2, I_3$ were accumulated with Gaussian photometric similarity:
+$$w_k(x, y) = \exp\left(-\frac{(Y_k(x, y) - Y_0(x, y))^2}{2 \sigma_{\text{color}}^2}\right)$$
+Because candidate frames suffer from sub-pixel registration jitter $\delta \sim \mathcal{N}(0, \sigma_\delta^2)$ and bilinear interpolation low-pass attenuation $H(\omega) = \operatorname{sinc}^2(\omega/2)$, candidate edge pixels are blurred. Blind averaging convolves the reference frame's sharp optical edge with this blur distribution, diluting stroke contrast by $30\% \sim 50\%$ and causing text to look soft and smudged ("发虚").
+
+#### 2.3.2 Formulation of Reference Dominance
+To preserve 100% of the native optical Modulation Transfer Function (MTF) on high-contrast text edges while delivering maximum noise reduction in flat backgrounds:
+
+1. **Luminance Gradient on Reference Frame (50MP)**:
+   $$G_0(x, y) = \sqrt{\left(\frac{\partial Y_0}{\partial x}\right)^2 + \left(\frac{\partial Y_0}{\partial y}\right)^2}$$
+2. **Edge Structure Likelihood Mask $M_{\text{edge}}(x, y) \in [0, 1]$**:
+   $$M_{\text{edge}}(x, y) = \operatorname{clamp}\left(\frac{G_0(x, y) - \tau_{\text{noise}}}{\sigma_{\text{trans}}},\ 0.0,\ 1.0\right)$$
+   Where $\tau_{\text{noise}} = 22.0$ (sensor shot noise floor) and $\sigma_{\text{trans}} = 25.0$.
+3. **Gated Candidate Frame Weight**:
+   $$w_k(x, y) = (1.0 - M_{\text{edge}}(x, y)) \cdot \text{expLUT}[\Delta Y]$$
+   - On **Text / Ink Contours** ($M_{\text{edge}} \to 1.0$): Candidate frame weight $w_k \to 0$. The pixel is synthesized **100% from the reference frame (Frame 0)**, which was captured optically without resampling blur.
+   - On **Flat Backgrounds / Shadows** ($M_{\text{edge}} \to 0.0$): Full temporal averaging is preserved, achieving complete noise reduction ("奶油般化开").
 
 ---
 

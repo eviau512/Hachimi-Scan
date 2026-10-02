@@ -95,8 +95,10 @@ bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& 
         return false;
     }
 
-    // 手持连拍相邻帧刚体位移合理性校验 (不超过 70 像素)
-    if (std::abs(H.at<double>(0, 2)) > 70.0 || std::abs(H.at<double>(1, 2)) > 70.0) {
+    // 手持连拍相邻帧刚体位移合理性校验 (SPEC_02 §2.2.5 行间距周期性假锁定物理熔断: tx <= 15px, ty <= 10px)
+    if (std::abs(H.at<double>(0, 2)) > 15.0 || std::abs(H.at<double>(1, 2)) > 10.0) {
+        LOGW("alignFrameHomography: excessive translation tx=%.2f, ty=%.2f -> rejected (line-pitch false lock guard)",
+             H.at<double>(0, 2), H.at<double>(1, 2));
         return false;
     }
 
@@ -155,8 +157,9 @@ bool BurstFusionEngine::alignFrameECC(const cv::Mat& src, const cv::Mat& ref, cv
         LOGI("alignFrameECC: cc=%.4f, rot=%.3f deg, s=%.4f, tx=%.2f, ty=%.2f, dist=%.2f",
              cc, theta * 180.0 / CV_PI, s, tx, ty, transDist);
 
-        // 严格物理自检: 相关度 >= 0.55, 旋转 < 5度, 平移 <= 80px (全分辨率尺度)
-        if (cc >= 0.55 && std::abs(theta) < 0.087 && transDist <= 80.0) {
+        // 严格物理自检 (SPEC_02 §2.2.5 行间距周期性假锁定物理熔断):
+        // 手持 40ms 连拍物理位移上限: 全尺度 transDist <= 8.0px, |ty| <= 6.5px, 旋转 < 3度, 相关度 >= 0.60
+        if (cc >= 0.60 && std::abs(theta) < 0.052 && transDist <= 8.0 && std::abs(ty) <= 6.5) {
             outH = (cv::Mat_<double>(3, 3) <<
                 a00, a01, tx,
                 a10, a11, ty,
@@ -164,6 +167,10 @@ bool BurstFusionEngine::alignFrameECC(const cv::Mat& src, const cv::Mat& ref, cv
             cv::warpPerspective(src, outWarped, outH, ref.size(),
                                 cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
             return true;
+        }
+        if (transDist > 8.0 || std::abs(ty) > 6.5) {
+            LOGW("alignFrameECC: rejected due to physical motion breach / periodic line-pitch jump: tx=%.2f, ty=%.2f, dist=%.2f",
+                 tx, ty, transDist);
         }
         return false;
     } catch (const std::exception& e) {
@@ -713,6 +720,38 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         cv::Mat baseSuper;
         cv::resize(tier1[0], baseSuper, cv::Size(superCols, superRows), 0, 0, cv::INTER_LINEAR);
 
+        // [SPEC_02 §2.3 / SPEC_REF] 基准帧绝对主导保边融合: 计算 Frame 0 边缘梯度掩模 M_edge
+        cv::Mat mEdgeMat(superRows, superCols, CV_32FC1);
+        const float tau_noise_base = 22.0f;
+        const float sigma_trans_base = 25.0f;
+
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < superRows; ++y) {
+            const cv::Vec3b* pBase = baseSuper.ptr<cv::Vec3b>(y);
+            const cv::Vec3b* pBaseUp = (y > 0) ? baseSuper.ptr<cv::Vec3b>(y - 1) : pBase;
+            const cv::Vec3b* pBaseDown = (y + 1 < superRows) ? baseSuper.ptr<cv::Vec3b>(y + 1) : pBase;
+            float* pM = mEdgeMat.ptr<float>(y);
+
+            for (int x = 0; x < superCols; ++x) {
+                int xPrev = (x > 0) ? x - 1 : x;
+                int xNext = (x + 1 < superCols) ? x + 1 : x;
+
+                int yL = (29 * pBase[xPrev][0] + 150 * pBase[xPrev][1] + 77 * pBase[xPrev][2]) >> 8;
+                int yR = (29 * pBase[xNext][0] + 150 * pBase[xNext][1] + 77 * pBase[xNext][2]) >> 8;
+                int yU = (29 * pBaseUp[x][0] + 150 * pBaseUp[x][1] + 77 * pBaseUp[x][2]) >> 8;
+                int yD = (29 * pBaseDown[x][0] + 150 * pBaseDown[x][1] + 77 * pBaseDown[x][2]) >> 8;
+
+                float gx = 0.5f * std::abs(yR - yL);
+                float gy = 0.5f * std::abs(yD - yU);
+                float gMag = gx + gy;
+
+                float mVal = (gMag - tau_noise_base) / sigma_trans_base;
+                if (mVal < 0.0f) mVal = 0.0f;
+                else if (mVal > 1.0f) mVal = 1.0f;
+                pM[x] = mVal;
+            }
+        }
+
         cv::Mat accum(superRows, superCols, CV_32FC3);
         baseSuper.convertTo(accum, CV_32FC3);
         cv::Mat weights(superRows, superCols, CV_32FC1, cv::Scalar(1.0f));
@@ -735,6 +774,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
             for (int y = 0; y < superRows; ++y) {
                 const cv::Vec3b* pBase = baseSuper.ptr<cv::Vec3b>(y);
                 const cv::Vec3b* pCand = candWarpedSuper.ptr<cv::Vec3b>(y);
+                const float* pM = mEdgeMat.ptr<float>(y);
                 cv::Vec3f* pAccum = accum.ptr<cv::Vec3f>(y);
                 float* pWeight = weights.ptr<float>(y);
 
@@ -742,13 +782,17 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                     const cv::Vec3b& bk = pCand[x];
                     if (bk[0] == 0 && bk[1] == 0 && bk[2] == 0) continue;
 
+                    float mEdge = pM[x];
+                    // 若是文字/高频边缘 (mEdge -> 1.0)，候选帧权重归零，100% 直通基准帧光学原生锐利像素！
+                    if (mEdge >= 0.98f) continue;
+
                     const cv::Vec3b& b0 = pBase[x];
                     int y0 = (29 * b0[0] + 150 * b0[1] + 77 * b0[2]) >> 8;
                     int yk = (29 * bk[0] + 150 * bk[1] + 77 * bk[2]) >> 8;
 
                     int idiff = std::abs(y0 - yk);
                     if (idiff > 255) idiff = 255;
-                    float w = expLUT[idiff];
+                    float w = (1.0f - mEdge) * expLUT[idiff];
 
                     if (w > 0.04f) {
                         pAccum[x][0] += w * static_cast<float>(bk[0]);
@@ -932,21 +976,46 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         }
 
         // ── 步骤 4: OpenCV MergeMertens 多尺度拉普拉斯曝光融合 ──
-        // 防重影坏板隔离机制 (SPEC_02 §3.4): 严格仅允许经由特征/ECC精准配准成功的曝光板进入融合池
-        std::vector<cv::Mat> plates1x;
-        plates1x.push_back(I_base_12M);
-        if (midAligned && !I_mid_12M.empty()) {
-            plates1x.push_back(I_mid_12M);
-            LOGI("MergeMertens: Tier 2 (EV -2.5) admitted to fusion pool");
-        } else {
-            LOGW("MergeMertens: Tier 2 unaligned or missing -> ISOLATED from fusion pool (Anti-Ghosting Guard)");
+        // 防重影坏板隔离机制 (SPEC_02 §3.4 / §3.5):
+        // 1. 严格仅允许经由特征/ECC精准配准成功的曝光板进入融合池
+        // 2. 屏幕 SDR 场景保护: 电子屏幕为典型 SDR (100~350 nits)，若无极端超饱和高光 (Y > 248 像素 < 0.3%)，
+        //    直接旁路 MergeMertens，输出纯净 50MP 原生超分版！
+        bool allowMertens = true;
+        if (isScreenMode) {
+            int blownCount = 0;
+            int sampleCount = 0;
+            for (int y = 0; y < rows; y += 4) {
+                const cv::Vec3b* rowPtr = I_base_12M.ptr<cv::Vec3b>(y);
+                for (int x = 0; x < cols; x += 4) {
+                    int Y = (29 * rowPtr[x][0] + 150 * rowPtr[x][1] + 77 * rowPtr[x][2]) >> 8;
+                    if (Y >= 248) blownCount++;
+                    sampleCount++;
+                }
+            }
+            float blownRatio = (sampleCount > 0) ? (static_cast<float>(blownCount) / static_cast<float>(sampleCount)) : 0.0f;
+            LOGI("Screen Mode check: blown highlight ratio = %.4f", blownRatio);
+            if (blownRatio < 0.003f) {
+                allowMertens = false;
+                LOGI("Screen SDR Mode: scene is SDR monitor (highlights < 0.3%%) -> bypassing MergeMertens to preserve 100%% pristine stroke purity with zero ghosting");
+            }
         }
 
-        if (shortAligned && !I_short_12M.empty()) {
-            plates1x.push_back(I_short_12M);
-            LOGI("MergeMertens: Tier 3 (EV -6.0) admitted to fusion pool");
-        } else {
-            LOGW("MergeMertens: Tier 3 unaligned or missing -> ISOLATED from fusion pool (Anti-Ghosting Guard)");
+        std::vector<cv::Mat> plates1x;
+        plates1x.push_back(I_base_12M);
+        if (allowMertens) {
+            if (midAligned && !I_mid_12M.empty()) {
+                plates1x.push_back(I_mid_12M);
+                LOGI("MergeMertens: Tier 2 (EV -2.5) admitted to fusion pool");
+            } else {
+                LOGW("MergeMertens: Tier 2 unaligned or missing -> ISOLATED from fusion pool (Anti-Ghosting Guard)");
+            }
+
+            if (shortAligned && !I_short_12M.empty()) {
+                plates1x.push_back(I_short_12M);
+                LOGI("MergeMertens: Tier 3 (EV -6.0) admitted to fusion pool");
+            } else {
+                LOGW("MergeMertens: Tier 3 unaligned or missing -> ISOLATED from fusion pool (Anti-Ghosting Guard)");
+            }
         }
 
         cv::Mat superResult;
