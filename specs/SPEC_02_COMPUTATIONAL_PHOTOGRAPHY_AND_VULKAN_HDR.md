@@ -157,25 +157,30 @@ To resolve cross-exposure failure and screen-scene moiré interference:
 3. In `isScreenMode`:
    - If maximum scene luminance $Y_{\max} < 245$ (no blown highlights requiring HDR compression), **isolate Tier 2 and Tier 3 from MergeMertens**, directly outputting the 50MP base super-resolution plate `I_base_50M`. This completely removes the multi-exposure fusion risk on electronic screens.
 
-### 2.3 [v19 REQUIRED] Step 1: Reference-Frame Dominant Edge Blending (基准帧绝对主导保边融合)
+### 2.3 [v22 REQUIRED] Step 1: MotoCam Parity Reference-Frame Dominance & De-motion (基准帧绝对主导与反假锁定熔断)
 
-#### 2.3.1 Mathematical Proof of Edge Softening under Averaging
-In the legacy implementation, candidate frames $I_1, I_2, I_3$ were accumulated with Gaussian photometric similarity:
-$$w_k(x, y) = \exp\left(-\frac{(Y_k(x, y) - Y_0(x, y))^2}{2 \sigma_{\text{color}}^2}\right)$$
-Because candidate frames suffer from sub-pixel registration jitter $\delta \sim \mathcal{N}(0, \sigma_\delta^2)$ and bilinear interpolation low-pass attenuation $H(\omega) = \operatorname{sinc}^2(\omega/2)$, candidate edge pixels are blurred. Blind averaging convolves the reference frame's sharp optical edge with this blur distribution, diluting stroke contrast by $30\% \sim 50\%$ and causing text to look soft and smudged ("发虚").
+#### 2.3.1 MotoCam Parity: Edge-MAD Alignment Verification (`bDropGhost`)
+In periodic text structures (such as code lines on computer monitors or printed documents), monolithic homography and correlation solvers are prone to locking onto adjacent text lines ($5 \sim 15$ px false shift).  
+To prevent false-locked candidate frames from contaminating the 50MP base plate:
+1. Extract reference frame edge set $E_0 = \{(x, y) \mid |\nabla Y_0(x, y)| > 20\}$.
+2. Compute the Mean Absolute Difference on edges:
+   $$\text{MAD}_{\text{edge}}(I_k^{\text{warped}}, I_0) = \frac{1}{|E_0|} \sum_{(x, y) \in E_0} \left| Y_k^{\text{warped}}(x, y) - Y_0(x, y) \right|$$
+3. **De-motion Gating Criterion**:
+   - Valid aligned frames with pure sensor noise satisfy $\text{MAD}_{\text{edge}} \le 12.0$.
+   - False-locked periodic shifts produce $\text{MAD}_{\text{edge}} \ge 35.0 \sim 80.0$.
+   - If $\text{MAD}_{\text{edge}} > 18.0$, the candidate frame is **DROPPED entirely (`bDropGhost`)** from super-resolution accumulation.
 
-#### 2.3.2 Formulation of Reference Dominance
-To preserve 100% of the native optical Modulation Transfer Function (MTF) on high-contrast text edges while delivering maximum noise reduction in flat backgrounds:
-
-1. **Luminance Gradient on Reference Frame (50MP)**:
-   $$G_0(x, y) = \sqrt{\left(\frac{\partial Y_0}{\partial x}\right)^2 + \left(\frac{\partial Y_0}{\partial y}\right)^2}$$
-2. **Edge Structure Likelihood Mask $M_{\text{edge}}(x, y) \in [0, 1]$**:
-   $$M_{\text{edge}}(x, y) = \operatorname{clamp}\left(\frac{G_0(x, y) - \tau_{\text{noise}}}{\sigma_{\text{trans}}},\ 0.0,\ 1.0\right)$$
-   Where $\tau_{\text{noise}} = 22.0$ (sensor shot noise floor) and $\sigma_{\text{trans}} = 25.0$.
-3. **Gated Candidate Frame Weight**:
-   $$w_k(x, y) = (1.0 - M_{\text{edge}}(x, y)) \cdot \text{expLUT}[\Delta Y]$$
-   - On **Text / Ink Contours** ($M_{\text{edge}} \to 1.0$): Candidate frame weight $w_k \to 0$. The pixel is synthesized **100% from the reference frame (Frame 0)**, which was captured optically without resampling blur.
-   - On **Flat Backgrounds / Shadows** ($M_{\text{edge}} \to 0.0$): Full temporal averaging is preserved, achieving complete noise reduction ("奶油般化开").
+#### 2.3.2 MotoCam Parity: Pixel-Level Gating (`AddBackEdge`) & Hard Photometric Clamp
+For candidate frames that pass the global edge verification:
+1. **Edge Dominance**: If $M_{\text{edge}}^{\text{base}}(x, y) \ge 0.10$, candidate weight $w_k(x, y) \equiv 0.0$ (100% reference frame edge preservation).
+2. **Hard Photometric Noise Cutoff**:
+   At ISO 800–3200, sensor photon noise satisfies $\sigma_n \le 6 \sim 8$.  
+   Any difference $|Y_0(x, y) - Y_k(x, y)| > 16.0$ is $> 2.5\sigma_n$ and represents structural motion or registration jitter.
+   $$\text{if } |Y_0(x, y) - Y_k(x, y)| > 16.0 \implies w_k(x, y) \equiv 0.0$$
+   This strictly prevents candidate frame glyphs from creating ghost shadows on dark backgrounds.
+3. **Physical Handheld Translation Bound**:
+   Within consecutive EV 0 burst frames (40ms interval with OIS), enforce:
+   $$\|\mathbf{t}\| \le 4.0\,\text{pixels}$$
 
 ---
 

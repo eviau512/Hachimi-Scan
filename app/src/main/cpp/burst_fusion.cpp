@@ -785,8 +785,35 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 continue;
             }
             double tDist = std::hypot(H.at<double>(0, 2), H.at<double>(1, 2));
-            if (tDist > 6.0) {
+            if (tDist > 4.0) {
                 LOGW("Tier 1 Frame %zu excessive displacement tDist=%.2f -> SKIPPED from super-res accumulation", k, tDist);
+                continue;
+            }
+
+            // [SPEC_02 §2.3.1 / MotoCam Parity] Edge-MAD 结构对齐校验 (bDropGhost 周期性假锁定熔断)
+            float edgeDiffSum = 0.0f;
+            int edgeCount = 0;
+            for (int y = 0; y < rows; y += 4) {
+                const cv::Vec3b* pB0 = tier1[0].ptr<cv::Vec3b>(y);
+                const cv::Vec3b* pBWarp = warped1x.ptr<cv::Vec3b>(y);
+                const cv::Vec3b* pBDown = (y + 4 < rows) ? tier1[0].ptr<cv::Vec3b>(y + 4) : pB0;
+                for (int x = 0; x < cols; x += 4) {
+                    int xNext = (x + 4 < cols) ? x + 4 : x;
+                    int y0 = (29 * pB0[x][0] + 150 * pB0[x][1] + 77 * pB0[x][2]) >> 8;
+                    int yR = (29 * pB0[xNext][0] + 150 * pB0[xNext][1] + 77 * pB0[xNext][2]) >> 8;
+                    int yD = (29 * pBDown[x][0] + 150 * pBDown[x][1] + 77 * pBDown[x][2]) >> 8;
+                    int grad = std::abs(yR - y0) + std::abs(yD - y0);
+                    if (grad > 20) {
+                        int yWarp = (29 * pBWarp[x][0] + 150 * pBWarp[x][1] + 77 * pBWarp[x][2]) >> 8;
+                        edgeDiffSum += std::abs(y0 - yWarp);
+                        edgeCount++;
+                    }
+                }
+            }
+            float madEdge = (edgeCount > 100) ? (edgeDiffSum / static_cast<float>(edgeCount)) : 0.0f;
+            LOGI("Tier 1 Frame %zu Edge-MAD check: edgeCount=%d, MAD_edge=%.2f", k, edgeCount, madEdge);
+            if (madEdge > 18.0f) {
+                LOGW("Tier 1 Frame %zu periodic line-pitch or ghost detected (MAD=%.2f > 18.0) -> DROPPED (De-motion Guard)", k, madEdge);
                 continue;
             }
 
@@ -807,17 +834,18 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                     if (bk[0] == 0 && bk[1] == 0 && bk[2] == 0) continue;
 
                     float mEdge = pM[x];
-                    // 若是文字/高频边缘 (mEdge >= 0.15f)，候选帧权重归零，100% 直通基准帧光学原生锐利像素！
-                    if (mEdge >= 0.15f) continue;
+                    // [MotoCam Parity: AddBackEdge] 若是文字/高频边缘 (mEdge >= 0.10f)，候选帧权重严格归零，100% 直通基准帧！
+                    if (mEdge >= 0.10f) continue;
 
                     const cv::Vec3b& b0 = pBase[x];
                     int y0 = (29 * b0[0] + 150 * b0[1] + 77 * b0[2]) >> 8;
                     int yk = (29 * bk[0] + 150 * bk[1] + 77 * bk[2]) >> 8;
 
                     int idiff = std::abs(y0 - yk);
-                    if (idiff > 255) idiff = 255;
-                    float w = (1.0f - mEdge) * expLUT[idiff];
+                    // [MotoCam Parity: 硬光度噪声截止] 散粒噪声最大差值不超过 16，超出 16 必为位移残差或伪影，强制剔除！
+                    if (idiff > 16) continue;
 
+                    float w = (1.0f - mEdge) * expLUT[idiff];
                     if (w > 0.04f) {
                         pAccum[x][0] += w * static_cast<float>(bk[0]);
                         pAccum[x][1] += w * static_cast<float>(bk[1]);
