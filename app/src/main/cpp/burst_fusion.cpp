@@ -203,7 +203,9 @@ bool BurstFusionEngine::alignFrameMTB(const cv::Mat& src, const cv::Mat& ref, cv
         cv::Point shift = aligner->calculateShift(grayRef, graySrc);
         LOGI("alignFrameMTB: computed robust exposure shift dx=%d, dy=%d", shift.x, shift.y);
 
-        if (std::abs(shift.x) > 80 || std::abs(shift.y) > 80) {
+        // 严格物理限制: 连拍帧间物理位移不超过 8 像素
+        if (std::abs(shift.x) > 8 || std::abs(shift.y) > 8) {
+            LOGW("alignFrameMTB: excessive shift dx=%d, dy=%d -> rejected", shift.x, shift.y);
             return false;
         }
 
@@ -278,7 +280,8 @@ bool BurstFusionEngine::alignGradientPhaseCorrelation(const cv::Mat& src, const 
 
     LOGI("alignGradientPhaseCorrelation: response=%.4f, dx=%.2f, dy=%.2f", response, dx, dy);
 
-    if (response >= 0.10 && std::abs(dx) <= 60.0 && std::abs(dy) <= 60.0) {
+    // 严格物理限制: 连拍帧间物理位移不超过 6 像素, 响应度 >= 0.20
+    if (response >= 0.20 && std::hypot(dx, dy) <= 6.0 && std::abs(dy) <= 5.0) {
         outH = (cv::Mat_<double>(3, 3) <<
             1.0, 0.0, dx,
             0.0, 1.0, dy,
@@ -286,6 +289,9 @@ bool BurstFusionEngine::alignGradientPhaseCorrelation(const cv::Mat& src, const 
         cv::warpPerspective(src, outWarped, outH, ref.size(),
                             cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         return true;
+    }
+    if (std::hypot(dx, dy) > 6.0) {
+        LOGW("alignGradientPhaseCorrelation: excessive shift dx=%.2f, dy=%.2f -> rejected", dx, dy);
     }
 
     return false;
@@ -486,15 +492,20 @@ bool BurstFusionEngine::alignHighlightTemplate(const cv::Mat& srcShort, const cv
             double theta = std::atan2(a10, a00);
             double transDist = std::hypot(tx, ty);
 
-            // 物理自检: 手持连续曝光 burst 旋转角 < 5度, 缩放 0.95~1.05, 平移 <= 45px (在 downscale 尺度下)
-            if (s >= 0.95 && s <= 1.05 && std::abs(theta) < 0.087 && transDist <= 45.0) {
+            double fullTx = tx * invScale;
+            double fullTy = ty * invScale;
+            // 物理自检: 手持连续曝光 burst 旋转角 < 3度, 缩放 0.96~1.04, 全图平移 <= 10.0px
+            if (s >= 0.96 && s <= 1.04 && std::abs(theta) < 0.052 && std::hypot(fullTx, fullTy) <= 10.0) {
                 outH = (cv::Mat_<double>(3, 3) <<
-                    a00, a01, tx * invScale,
-                    a10, a11, ty * invScale,
+                    a00, a01, fullTx,
+                    a10, a11, fullTy,
                     0.0, 0.0, 1.0);
                 fitSuccess = true;
                 LOGI("alignHighlightTemplate: fitted Multi-Peak Rigid Affine: s=%.4f, rot=%.3f deg, tx=%.2f, ty=%.2f",
-                     s, theta * 180.0 / CV_PI, tx * invScale, ty * invScale);
+                     s, theta * 180.0 / CV_PI, fullTx, fullTy);
+            } else {
+                LOGW("alignHighlightTemplate: rejected affine fit: s=%.4f, rot=%.3f deg, tx=%.2f, ty=%.2f",
+                     s, theta * 180.0 / CV_PI, fullTx, fullTy);
             }
         }
     }
@@ -514,12 +525,15 @@ bool BurstFusionEngine::alignHighlightTemplate(const cv::Mat& srcShort, const cv
         LOGI("alignHighlightTemplate: single/best-peak translation: dx=%.2f, dy=%.2f, score=%.4f",
              fullDx, fullDy, bestScore);
 
-        if (std::hypot(fullDx, fullDy) <= 120.0) {
+        if (bestScore >= 0.65 && std::hypot(fullDx, fullDy) <= 10.0) {
             outH = (cv::Mat_<double>(3, 3) <<
                 1.0, 0.0, fullDx,
                 0.0, 1.0, fullDy,
                 0.0, 0.0, 1.0);
             fitSuccess = true;
+        } else {
+            LOGW("alignHighlightTemplate: rejected single-peak shift dx=%.2f, dy=%.2f, score=%.4f",
+                 fullDx, fullDy, bestScore);
         }
     }
 
@@ -722,8 +736,8 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
 
         // [SPEC_02 §2.3 / SPEC_REF] 基准帧绝对主导保边融合: 计算 Frame 0 边缘梯度掩模 M_edge
         cv::Mat mEdgeMat(superRows, superCols, CV_32FC1);
-        const float tau_noise_base = 22.0f;
-        const float sigma_trans_base = 25.0f;
+        const float tau_noise_base = 10.0f;
+        const float sigma_trans_base = 20.0f;
 
         #pragma omp parallel for schedule(static)
         for (int y = 0; y < superRows; ++y) {
@@ -759,13 +773,23 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         for (size_t k = 1; k < tier1.size(); ++k) {
             cv::Mat warped1x, H;
             // Tier 1 相同曝光：优先 CLAHE ORB，若微抖动失配则尝试 ECC，再回退对数梯度相位相关
-            if (!alignFrameHomography(tier1[k], tier1[0], warped1x, H)) {
-                if (!alignFrameECC(tier1[k], tier1[0], warped1x, H)) {
-                    if (!alignGradientPhaseCorrelation(tier1[k], tier1[0], warped1x, H)) {
-                        H = cv::Mat::eye(3, 3, CV_64F);
-                    }
-                }
+            bool alignedT1 = alignFrameHomography(tier1[k], tier1[0], warped1x, H);
+            if (!alignedT1) {
+                alignedT1 = alignFrameECC(tier1[k], tier1[0], warped1x, H);
             }
+            if (!alignedT1) {
+                alignedT1 = alignGradientPhaseCorrelation(tier1[k], tier1[0], warped1x, H);
+            }
+            if (!alignedT1 || H.empty()) {
+                LOGW("Tier 1 Frame %zu alignment failed -> SKIPPED from super-res accumulation", k);
+                continue;
+            }
+            double tDist = std::hypot(H.at<double>(0, 2), H.at<double>(1, 2));
+            if (tDist > 6.0) {
+                LOGW("Tier 1 Frame %zu excessive displacement tDist=%.2f -> SKIPPED from super-res accumulation", k, tDist);
+                continue;
+            }
+
             cv::Mat H2x = S2 * H;
             cv::Mat candWarpedSuper;
             cv::warpPerspective(tier1[k], candWarpedSuper, H2x, cv::Size(superCols, superRows), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
@@ -783,8 +807,8 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                     if (bk[0] == 0 && bk[1] == 0 && bk[2] == 0) continue;
 
                     float mEdge = pM[x];
-                    // 若是文字/高频边缘 (mEdge -> 1.0)，候选帧权重归零，100% 直通基准帧光学原生锐利像素！
-                    if (mEdge >= 0.98f) continue;
+                    // 若是文字/高频边缘 (mEdge >= 0.15f)，候选帧权重归零，100% 直通基准帧光学原生锐利像素！
+                    if (mEdge >= 0.15f) continue;
 
                     const cv::Vec3b& b0 = pBase[x];
                     int y0 = (29 * b0[0] + 150 * b0[1] + 77 * b0[2]) >> 8;
@@ -978,26 +1002,12 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         // ── 步骤 4: OpenCV MergeMertens 多尺度拉普拉斯曝光融合 ──
         // 防重影坏板隔离机制 (SPEC_02 §3.4 / §3.5):
         // 1. 严格仅允许经由特征/ECC精准配准成功的曝光板进入融合池
-        // 2. 屏幕 SDR 场景保护: 电子屏幕为典型 SDR (100~350 nits)，若无极端超饱和高光 (Y > 248 像素 < 0.3%)，
-        //    直接旁路 MergeMertens，输出纯净 50MP 原生超分版！
+        // 2. 屏幕 SDR 场景保护: 电子屏幕为典型 SDR (100~350 nits)，EV 0 动态范围已全覆盖，
+        //    屏幕模式下无条件旁路 MergeMertens，100% 杜绝跨曝光错位洗刷与笔画模糊！
         bool allowMertens = true;
         if (isScreenMode) {
-            int blownCount = 0;
-            int sampleCount = 0;
-            for (int y = 0; y < rows; y += 4) {
-                const cv::Vec3b* rowPtr = I_base_12M.ptr<cv::Vec3b>(y);
-                for (int x = 0; x < cols; x += 4) {
-                    int Y = (29 * rowPtr[x][0] + 150 * rowPtr[x][1] + 77 * rowPtr[x][2]) >> 8;
-                    if (Y >= 248) blownCount++;
-                    sampleCount++;
-                }
-            }
-            float blownRatio = (sampleCount > 0) ? (static_cast<float>(blownCount) / static_cast<float>(sampleCount)) : 0.0f;
-            LOGI("Screen Mode check: blown highlight ratio = %.4f", blownRatio);
-            if (blownRatio < 0.003f) {
-                allowMertens = false;
-                LOGI("Screen SDR Mode: scene is SDR monitor (highlights < 0.3%%) -> bypassing MergeMertens to preserve 100%% pristine stroke purity with zero ghosting");
-            }
+            allowMertens = false;
+            LOGI("Screen SDR Mode (SPEC_02 §3.5): electronic display is strictly SDR -> unconditionally bypassing MergeMertens to preserve 100%% pristine stroke purity with zero ghosting");
         }
 
         std::vector<cv::Mat> plates1x;
@@ -1140,8 +1150,8 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         cv::Sobel(Y_float, grad_y, CV_32F, 0, 1, 3);
         cv::magnitude(grad_x, grad_y, grad_mag);
 
-        const float tau_noise   = 22.0f;
-        const float sigma_trans = 25.0f;
+        const float tau_noise   = 10.0f;
+        const float sigma_trans = 20.0f;
         cv::Mat M_edge = (grad_mag - tau_noise) / sigma_trans;
         cv::threshold(M_edge, M_edge, 0.0f, 0.0f, cv::THRESH_TOZERO);   // clamp 下界
         cv::min(M_edge, 1.0f, M_edge);                                   // clamp 上界
@@ -1150,11 +1160,26 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         cv::Mat Y_smooth_float;
         cv::bilateralFilter(Y_float, Y_smooth_float, 7, 35.0, 7.0);
 
-        // 6. 锐化分支: Unsharp Mask (amount=0.35, σ=2.0)
-        //    Y_sharp = 1.35·Y - 0.35·Gaussian(Y, σ=2)
+        // 6. 锐化与微反差分支: 50MP Acutance Synthesis (amount=0.75, σ=1.8 + adaptive micro-contrast)
         cv::Mat Y_gauss;
-        cv::GaussianBlur(Y_float, Y_gauss, cv::Size(0, 0), 2.0);
-        cv::Mat Y_sharp_float = Y_float * 1.35f - Y_gauss * 0.35f;
+        cv::GaussianBlur(Y_float, Y_gauss, cv::Size(0, 0), 1.8);
+        cv::Mat Y_diff = Y_float - Y_gauss;
+        cv::Mat Y_sharp_float = Y_float + 0.75f * Y_diff;
+
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < superRows; ++y) {
+            const float* pDiff = Y_diff.ptr<float>(y);
+            float* pSharp = Y_sharp_float.ptr<float>(y);
+            for (int x = 0; x < superCols; ++x) {
+                float d = pDiff[x];
+                float absD = std::abs(d);
+                if (absD > 3.0f) {
+                    float sign = (d > 0.0f) ? 1.0f : -1.0f;
+                    float boost = std::min(absD * 0.6f, 25.0f);
+                    pSharp[x] += sign * boost;
+                }
+            }
+        }
 
         // 7. 按掩模 alpha 混合: Y_final = (1-M)·Y_smooth + M·Y_sharp
         cv::Mat Y_final_float = Y_smooth_float.mul(1.0f - M_edge)

@@ -2,7 +2,7 @@
 ## 技术规格书 02：计算摄影与多尺度拉普拉斯 HDR 曝光融合规范
 
 > **Document Status**: Authoritative Core Pipeline Specification  
-> **Implementation Status**: v18 deployed (`versionCode=18`, commit `4d5599a`, branch `gpu-hdr`); v19 active (Reference-Frame Dominant Edge Blending, Periodic Line-Pitch Clamping, SDR Screen Isolation)  
+> **Implementation Status**: v19 deployed (`versionCode=19`, commit `88f1a05`, branch `gpu-hdr`); v20 active (Screen Direct 50MP Super-Res, Signed Frequency Reconstruction, and Adaptive Acutance Synthesis)  
 > **Consolidates**: Legacy SPEC_04 (Burst Fusion), SPEC_08 (Stability), SPEC_09 (De-ghosting), SPEC_10 (Highlight Grafting), SPEC_12 (Saturation Grafting), SPEC_13 (Tone Mapping), SPEC_17 (Vulkan Pipeline), SPEC_18 (Smart HDR 9-Frame Architecture), and SPEC_REF_OEM_RAW_HDR_AND_DENSE_ALIGNMENT (OEM Forensics & Edge Dominance)  
 > **Target Audience**: Computer Vision & Computational Photography Engineers  
 > **Languages**: Primary: English / Secondary: Chinese (Bilingual Executive Summaries)
@@ -11,7 +11,7 @@
 
 ## 1. Mathematical Architecture Overview / 算法全景
 
-The computational photography engine implements an **Apple Deep Fusion / Smart HDR 7-Frame Multi-Exposure Pyramid** coupled with **OpenCV `createMergeMertens` Multi-Scale Laplacian Pyramid Fusion**, **Reference-Frame Dominant Edge Blending**, and **Two-Scale Frequency Super-Resolution**:
+The computational photography engine implements an **Apple Deep Fusion / Smart HDR 7-Frame Multi-Exposure Pyramid** coupled with **OpenCV `createMergeMertens` Multi-Scale Laplacian Pyramid Fusion**, **Reference-Frame Dominant Edge Blending**, **Signed Two-Scale Frequency Reconstruction**, and **Adaptive Acutance Synthesis**:
 
 ```mermaid
 graph TD
@@ -227,27 +227,24 @@ To completely eliminate double-image ghosting:
 ### 3.5 Screen Capture Mode & Moiré Interference Shielding (`isScreenMode`)
 
 When `isScreenMode == true` (capturing PC monitors, laptops, tablets, or phone screens):
-1. **Moiré-Immune Alignment**: Priority is assigned to **AlignMTB**, which evaluates median luminance topologies rather than high-frequency gradient features corrupted by Bayer-display beat frequencies.
-2. **Dynamic Range Awareness**: Electronic displays operate in Standard Dynamic Range (SDR, 100–350 nits), lacking extreme incandescent filament brightness. If Tier 2 or Tier 3 exhibit unresolvable hand jitter or ambiguity, they are safely dropped, preserving 100% of the screen text sharpness without ghost copies.
+### 3.5 Screen Capture Mode & Absolute Single-Exposure Guarantee (`isScreenMode`)
+
+When `isScreenMode == true` (capturing PC monitors, laptops, tablets, or phone screens):
+1. **Absolute Bypass of MergeMertens**: Electronic displays operate strictly in Standard Dynamic Range (SDR, 100–350 nits). The base auto-exposure (EV 0) completely covers the screen's full dynamic range without sensor saturation.
+2. **Zero-Tolerance for Multi-Exposure Blurring**: Admitting Tier 2 (-2.5 EV) or Tier 3 (-6.0 EV) into MergeMertens on repetitive text/code lines guarantees phase mismatch and contrast dilution. **In Screen Mode, MergeMertens is unconditionally bypassed**, directly outputting the 50MP base super-resolution plate `I_base_50M`.
 
 ---
 
+## 4. Signed Two-Scale Frequency Super-Resolution (50MP) / 有符号双尺度高频超分重构
 
-
-## 4. Two-Scale Frequency Super-Resolution (50MP) / 双尺度高频超分重构
-
-Direct 50MP Laplacian pyramid processing requires $>3.2\,\text{GB}$ of memory allocations. The engine deploys a **Two-Scale Frequency Decomposition**:
-1. Run `MergeMertens` on 12MP plates $\to I_{\text{hdr\_12M}}$ ($<150\,\text{MB}$ memory, $\approx 120\,\text{ms}$).
-2. Upscale $I_{\text{hdr\_12M}}$ to 50MP ($8160 \times 6144$) via bicubic interpolation $\to I_{\text{fused\_50M\_smooth}}$.
-3. Extract high-frequency sub-pixel detail band from the 4-phase accumulation:
-   $$D_{\text{base\_50M}} = I_{\text{base\_50M}} - \text{resize}(I_{\text{base\_12M}}, 50\text{MP}, \text{INTER\_CUBIC})$$
-4. Extract highlight filament detail band from Tier 3:
-   $$D_{\text{short\_50M}} = \text{shortSuper} - \text{resize}(I_{\text{short\_12M}}, 50\text{MP}, \text{INTER\_CUBIC})$$
-5. Detail Blending Mask:
-   $$\alpha_{\text{highlight}} = \text{clamp}\left(\frac{Y_{\text{hdr}} - 180.0}{60.0}, 0.0, 1.0\right)$$
-   $$D_{\text{final}} = (1.0 - \alpha_{\text{highlight}}) \cdot D_{\text{base\_50M}} + \alpha_{\text{highlight}} \cdot D_{\text{short\_50M}}$$
-   $$I_{\text{final\_50M}} = \text{clamp}(I_{\text{fused\_50M\_smooth}} + D_{\text{final}}, 0, 255)$$
-
+When multi-exposure HDR fusion is active (e.g. real desk lamps):
+1. Run `MergeMertens` on 12MP plates $\to I_{\text{hdr\_12M}}$.
+2. Upscale $I_{\text{hdr\_12M}}$ to 50MP ($8192 \times 6144$) via bilinear interpolation $\to I_{\text{fused\_50M\_smooth}}$.
+3. **Signed High-Frequency Detail Extraction**:
+   To prevent OpenCV `CV_8U` saturate-cast clamping of negative details (which destroys dark ink strokes on light backgrounds), detail subtraction is executed in signed 32-bit float (`CV_32FC3`):
+   $$D_{\text{base\_50M}}(x, y) = I_{\text{base\_50M}}^{\text{float}}(x, y) - I_{\text{base\_smooth}}^{\text{float}}(x, y)$$
+4. Highlight Detail Blend & Clamping:
+   $$I_{\text{final\_50M}} = \operatorname{clamp}\left(I_{\text{fused\_50M\_smooth}}^{\text{float}} + D_{\text{final}}^{\text{float}},\ 0,\ 255\right)$$
 
 ---
 
@@ -262,66 +259,25 @@ Deepens blacks and eliminates dark shadow chromatic noise. Applies only to $Y \l
 
 ---
 
-### 5.2 Step 6: Adaptive Micro-Contrast Texture Synthesis ⚠️ DEPRECATED in Low-Light (v17)
+### 5.2 Step 6 [v20]: YCrCb Structure-Aware Denoising & Adaptive Acutance Synthesis
 
-> [!WARNING]
-> **Root Cause of Low-Light Noise Degradation.** At ISO ≥ 8000 (flat-surface noise σ ≈ 18, amplitude ±30), the blind threshold `tau=2` treats ~90% of shot noise as "texture" and amplifies it via `beta=0.55`. This transforms the smooth lamp base into a noisy smear while providing zero benefit to actual text edges. **This pass must be gated or replaced in v17.**
+#### 5.2.1 Noise vs. Structure Discriminator
+To prevent bilateral smoothing from eroding outer text skirts, set $\tau_{\text{noise}} = 10.0$ and $\sigma_{\text{trans}} = 20.0$:
+$$M_{\text{edge}}(x, y) = \operatorname{clamp}\left(\frac{|\nabla Y(x, y)| - 10.0}{20.0},\ 0.0,\ 1.0\right)$$
 
-**Current implementation (v16, `burst_fusion.cpp` Step 6):**
-$$D = Y - Y_{\text{blur}}, \quad \text{if } |D| > 2: \quad \Delta Y = \text{sign}(D) \cdot \min((|D| - 2) \cdot 0.55,\ 16.0)$$
-$$C_{\text{final}} = \text{clamp}(C + \Delta Y, 0, 255)$$
+#### 5.2.2 Chroma Denoising
+- Apply `GaussianBlur(σ=3.0, kernel=9×9)` independently on Cr and Cb channels.
 
-**Failure mode**: $\tau = 2 \ll \sigma_{\text{noise}} \approx 18$, so the gate is always open, amplifying noise in every flat region (walls, lamp bases, white paper).
-
----
-
-### 5.3 [v17 REQUIRED] YCrCb Structure-Aware ISP Denoising Pipeline
-
-**Goal**: Match MotoCam's "butter-smooth" flat areas while retaining HachiCam's text/edge sharpness. Validated via Python prototype on v16 test shots (ISO 17984, 台灯 scene).
-
-#### 5.3.1 Noise vs. Structure Discriminator — Edge-Likelihood Coring Mask
-
-Distinguishing noise from real edges requires a per-pixel gradient signal in the luma channel:
-
-$$M_{\text{edge}}(x,y) = \text{clamp}\!\left(\frac{|\nabla Y(x,y)| - \tau_{\text{noise}}}{\sigma_{\text{trans}}},\ 0,\ 1\right)$$
-
-| Parameter | Value | Rationale |
-|:---|:---|:---|
-| $\tau_{\text{noise}}$ | 22 | Just above $\sigma_{\text{noise}} \approx 18$ at ISO 17984 |
-| $\sigma_{\text{trans}}$ | 25 | Smooth gradient → $M=0$ (noise), strong edge → $M=1$ (structure) |
-
-- $M_{\text{edge}} \approx 0$: flat region (noise-dominant) → apply heavy smoothing branch
-- $M_{\text{edge}} \approx 1$: text/edge region → apply sharpening branch
-
-#### 5.3.2 YCrCb Separation & Chroma Denoising
-
-Convert the output of Step 5 to YCrCb:
-
-- **Chroma (Cr, Cb)**: apply `GaussianBlur(σ=3.0, kernel=9×9)` independently on each channel.
-  - Color noise in Cr/Cb is always random; large-radius Gaussian is safe and has zero effect on luminance detail.
-- **Luma (Y)**: split into two branches gated by $M_{\text{edge}}$.
-
-#### 5.3.3 Luma Dual-Branch Processing
-
+#### 5.2.3 Luma Dual-Branch Processing & Acutance Synthesis (v20)
 | Branch | Condition | Operation |
 |:---|:---|:---|
 | **Smooth** (flat region) | $M_{\text{edge}} \approx 0$ | `bilateralFilter(Y, d=7, σ_color=35, σ_space=7)` |
-| **Sharp** (text/edge) | $M_{\text{edge}} \approx 1$ | $Y_{\text{sharp}} = 1.35 \cdot Y - 0.35 \cdot \text{GaussianBlur}(Y, \sigma=2)$ (Unsharp Mask) |
+| **Sharp** (text/edge) | $M_{\text{edge}} \approx 1$ | Unsharp Mask (amount=0.75, σ=1.8) + Adaptive Micro-Contrast ($\tau=3.0, \beta=0.6$) |
 
-**Blended output:**
-$$Y_{\text{final}} = (1 - M_{\text{edge}}) \cdot Y_{\text{smooth}} + M_{\text{edge}} \cdot Y_{\text{sharp}}$$
-
-#### 5.3.4 Integration with Step 6 Replacement
-
-In v17, Step 6 (`burst_fusion.cpp`) shall be rewritten as:
-1. Convert `fused50M` from BGR to YCrCb.
-2. Extract Y, Cr, Cb planes.
-3. Compute gradient magnitude map on Y; derive $M_{\text{edge}}$.
-4. Apply Gaussian (σ=3) to Cr and Cb.
-5. Apply bilateral filter to Y for flat regions; Unsharp Mask for edge regions.
-6. Blend using $M_{\text{edge}}$ mask.
-7. Merge back to BGR.
-
-> [!IMPORTANT]
-> **Regression guard**: document-scanning text sharpness must not regress. The $M_{\text{edge}}$ sharpening branch must engage whenever ink strokes are present. Run side-by-side comparison on a printed A4 sheet with 8pt font before merging v17.
+Mathematical formulation of 50MP Acutance Synthesis:
+$$Y_{\text{gauss}} = \operatorname{GaussianBlur}(Y, \sigma=1.8)$$
+$$D = Y - Y_{\text{gauss}}$$
+$$\Delta Y_{\text{micro}} = \begin{cases} 0 & \text{if } |D| \le 3.0 \\ \operatorname{sign}(D) \cdot \min(|D| \cdot 0.6,\ 25.0) & \text{if } |D| > 3.0 \end{cases}$$
+$$Y_{\text{sharp}} = \operatorname{clamp}\left(Y + 0.75 \cdot D + \Delta Y_{\text{micro}},\ 0,\ 255\right)$$
+$$Y_{\text{final}} = (1.0 - M_{\text{edge}}) \cdot Y_{\text{smooth}} + M_{\text{edge}} \cdot Y_{\text{sharp}}$$
 
