@@ -224,27 +224,45 @@ To completely eliminate double-image ghosting:
 3. Tier 3 gate: `if (shortAligned && !I_short_12M.empty()) plates1x.push_back(I_short_12M);`
 4. If `plates1x.size() < 2`, `MergeMertens` is bypassed entirely, and `superResult` defaults directly to `I_base_50M`. Zero unaligned high-frequency strokes are permitted to enter the Laplacian pyramid.
 
-### 3.5 Screen Capture Mode & Moiré Interference Shielding (`isScreenMode`)
+### 3.5 [v21 REQUIRED] Base-Locked Highlight Grafting HDR (基准帧锁定与高光单向保边嫁接规范)
 
-When `isScreenMode == true` (capturing PC monitors, laptops, tablets, or phone screens):
-### 3.5 Screen Capture Mode & Absolute Single-Exposure Guarantee (`isScreenMode`)
+> [!IMPORTANT]
+> **Root Cause Forensics (v20 Highlight Loss Incident)**:  
+> In v20, unconditionally bypassing MergeMertens under `isScreenMode` caused ALL captures (which passed `isScreenMode = true`) to drop Tier 2 and Tier 3 frames entirely. Highlights and lamp bulbs blew out to pure white (255, 255, 255).  
+> Conversely, blind global MergeMertens replaces low frequencies across the entire image, mixing misaligned dark frames into clean text.  
+> **Resolution**: Reinstate the **Base-Locked Highlight Grafting** architecture (SPEC_10 & SPEC_REF §2.3):
+> 1. Normal/dark text and background ($Y_{\text{base}} \le 200$) are **100% bit-exact locked to the 50MP base super-resolution plate `I_base_50M`**. Underexposed frames have ZERO influence on text edges.
+> 2. Saturated/overexposed regions ($Y_{\text{base}} > 200$) smoothly blend the HDR tone-mapped highlight recovery plate via Hermite smoothstep.
 
-When `isScreenMode == true` (capturing PC monitors, laptops, tablets, or phone screens):
-1. **Absolute Bypass of MergeMertens**: Electronic displays operate strictly in Standard Dynamic Range (SDR, 100–350 nits). The base auto-exposure (EV 0) completely covers the screen's full dynamic range without sensor saturation.
-2. **Zero-Tolerance for Multi-Exposure Blurring**: Admitting Tier 2 (-2.5 EV) or Tier 3 (-6.0 EV) into MergeMertens on repetitive text/code lines guarantees phase mismatch and contrast dilution. **In Screen Mode, MergeMertens is unconditionally bypassed**, directly outputting the 50MP base super-resolution plate `I_base_50M`.
+#### Mathematical Formulation:
+Let $Y_{\text{base}}(x, y) = 0.114 B_{\text{base}} + 0.587 G_{\text{base}} + 0.299 R_{\text{base}}$ be the luminance of the 50MP base plate.
+1. **Highlight Grafting Weight**:
+   $$u(x, y) = \operatorname{clamp}\left(\frac{Y_{\text{base}}(x, y) - 200.0}{45.0},\ 0.0,\ 1.0\right)$$
+   $$w_{\text{hdr}}(x, y) = u^2 \cdot (3.0 - 2.0 \cdot u)$$
+2. **Behavioral Invariants**:
+   - On **Document Text & Backgrounds** ($Y_{\text{base}} \le 200$): $w_{\text{hdr}} \equiv 0.0$.  
+     $$I_{\text{out}}(x, y) = I_{\text{base\_50M}}(x, y)$$
+     Zero ghosting, zero edge smudging, 100% optical MTF preservation.
+   - On **Extreme Highlights & Bulbs** ($Y_{\text{base}} \ge 245$): $w_{\text{hdr}} \equiv 1.0$.  
+     $$I_{\text{out}}(x, y) = V_{\text{hdr}}(x, y)$$
+     Full dynamic range recovery with zero dead-white clipping.
+   - On **Transition Skirts** ($200 < Y_{\text{base}} < 245$): $C^1$ continuous Hermite blend with zero seams.
 
 ---
 
-## 4. Signed Two-Scale Frequency Super-Resolution (50MP) / 有符号双尺度高频超分重构
+## 4. [v21] High-Dynamic Highlight Reconstruction (50MP) / 50MP 高动态高光重构
 
-When multi-exposure HDR fusion is active (e.g. real desk lamps):
-1. Run `MergeMertens` on 12MP plates $\to I_{\text{hdr\_12M}}$.
+When multi-exposure HDR fusion is active (`plates1x.size() >= 2`):
+1. Run `MergeMertens` on 12MP downsampled plates $\to I_{\text{hdr\_12M}}$.
 2. Upscale $I_{\text{hdr\_12M}}$ to 50MP ($8192 \times 6144$) via bilinear interpolation $\to I_{\text{fused\_50M\_smooth}}$.
-3. **Signed High-Frequency Detail Extraction**:
-   To prevent OpenCV `CV_8U` saturate-cast clamping of negative details (which destroys dark ink strokes on light backgrounds), detail subtraction is executed in signed 32-bit float (`CV_32FC3`):
-   $$D_{\text{base\_50M}}(x, y) = I_{\text{base\_50M}}^{\text{float}}(x, y) - I_{\text{base\_smooth}}^{\text{float}}(x, y)$$
-4. Highlight Detail Blend & Clamping:
-   $$I_{\text{final\_50M}} = \operatorname{clamp}\left(I_{\text{fused\_50M\_smooth}}^{\text{float}} + D_{\text{final}}^{\text{float}},\ 0,\ 255\right)$$
+3. Upscale $I_{\text{base\_12M}}$ to 50MP $\to I_{\text{base\_smooth}}$.
+4. Extract signed high-frequency detail for highlight regions:
+   $$D_{\text{base}}(x, y) = I_{\text{base\_50M}}(x, y) - I_{\text{base\_smooth}}(x, y)$$
+   $$D_{\text{short}}(x, y) = I_{\text{short\_50M}}(x, y) - I_{\text{short\_smooth}}(x, y)$$
+   $$D_{\text{detail}} = (1.0 - \alpha_{\text{short}}) \cdot D_{\text{base}} + \alpha_{\text{short}} \cdot D_{\text{short}}$$
+   $$V_{\text{hdr}} = \operatorname{clamp}\left(I_{\text{fused\_50M\_smooth}} + D_{\text{detail}},\ 0,\ 255\right)$$
+5. **Base-Locked Grafting Composite**:
+   $$I_{\text{super}}(x, y) = \operatorname{clamp}\left( (1.0 - w_{\text{hdr}}(x, y)) \cdot I_{\text{base\_50M}}(x, y) + w_{\text{hdr}}(x, y) \cdot V_{\text{hdr}}(x, y),\ 0,\ 255\right)$$
 
 ---
 

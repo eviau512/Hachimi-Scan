@@ -999,33 +999,27 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
             cv::warpPerspective(tier3[0], shortSuper, H2x_short, cv::Size(superCols, superRows), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         }
 
-        // ── 步骤 4: OpenCV MergeMertens 多尺度拉普拉斯曝光融合 ──
-        // 防重影坏板隔离机制 (SPEC_02 §3.4 / §3.5):
-        // 1. 严格仅允许经由特征/ECC精准配准成功的曝光板进入融合池
-        // 2. 屏幕 SDR 场景保护: 电子屏幕为典型 SDR (100~350 nits)，EV 0 动态范围已全覆盖，
-        //    屏幕模式下无条件旁路 MergeMertens，100% 杜绝跨曝光错位洗刷与笔画模糊！
-        bool allowMertens = true;
-        if (isScreenMode) {
-            allowMertens = false;
-            LOGI("Screen SDR Mode (SPEC_02 §3.5): electronic display is strictly SDR -> unconditionally bypassing MergeMertens to preserve 100%% pristine stroke purity with zero ghosting");
-        }
-
+        // ── 步骤 4: 基准帧绝对锁定与高光单向保边嫁接 HDR 融合 (SPEC_02 §3.5 / SPEC_10 §2) ──
+        // 1. 严格防重影准入：仅允许精准配准的 Tier 2 (EV -2.5) 与 Tier 3 (EV -6.0) 曝光板进入恢复池
+        // 2. 基准帧绝对锁定律：在暗部与正常中间调、文字区域 (Y_base <= 200)，
+        //    100% 锁定 I_base_50M 原生超分底版，欠曝帧权重严格为 0，永无任何重影与发虚！
+        // 3. 高光单向平滑嫁接：仅在基准帧过曝区域 (Y_base > 200)，通过三次 Hermite smoothstep 平滑嫁接 HDR 细节，
+        //    恢复灯具、高亮反光与窗外强光细节，彻底告别“死白一片”！
         std::vector<cv::Mat> plates1x;
         plates1x.push_back(I_base_12M);
-        if (allowMertens) {
-            if (midAligned && !I_mid_12M.empty()) {
-                plates1x.push_back(I_mid_12M);
-                LOGI("MergeMertens: Tier 2 (EV -2.5) admitted to fusion pool");
-            } else {
-                LOGW("MergeMertens: Tier 2 unaligned or missing -> ISOLATED from fusion pool (Anti-Ghosting Guard)");
-            }
 
-            if (shortAligned && !I_short_12M.empty()) {
-                plates1x.push_back(I_short_12M);
-                LOGI("MergeMertens: Tier 3 (EV -6.0) admitted to fusion pool");
-            } else {
-                LOGW("MergeMertens: Tier 3 unaligned or missing -> ISOLATED from fusion pool (Anti-Ghosting Guard)");
-            }
+        if (midAligned && !I_mid_12M.empty()) {
+            plates1x.push_back(I_mid_12M);
+            LOGI("HDR Fusion: Tier 2 (EV -2.5) admitted to highlight pool");
+        } else {
+            LOGW("HDR Fusion: Tier 2 unaligned or missing -> ISOLATED from highlight pool (Anti-Ghosting Guard)");
+        }
+
+        if (shortAligned && !I_short_12M.empty()) {
+            plates1x.push_back(I_short_12M);
+            LOGI("HDR Fusion: Tier 3 (EV -6.0) admitted to highlight pool");
+        } else {
+            LOGW("HDR Fusion: Tier 3 unaligned or missing -> ISOLATED from highlight pool (Anti-Ghosting Guard)");
         }
 
         cv::Mat superResult;
@@ -1059,7 +1053,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 cv::resize(I_short_12M, shortSmooth50M, cv::Size(superCols, superRows), 0, 0, cv::INTER_LINEAR);
             }
 
-            // 双尺度高频超分纹理回填
+            // 基准帧绝对锁定与高光单向保边嫁接 (SPEC_02 §3.5)
             superResult = cv::Mat(superRows, superCols, CV_8UC3);
             #pragma omp parallel for schedule(static)
             for (int y = 0; y < superRows; ++y) {
@@ -1071,25 +1065,40 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 cv::Vec3b* pOut = superResult.ptr<cv::Vec3b>(y);
 
                 for (int x = 0; x < superCols; ++x) {
+                    const cv::Vec3b& bSuper = pBaseSuper[x];
+                    float yBase = 0.114f * static_cast<float>(bSuper[0]) + 0.587f * static_cast<float>(bSuper[1]) + 0.299f * static_cast<float>(bSuper[2]);
+
+                    // 1. 基准帧绝对保护律: 绝大多数正常文字、纸张、暗部 (Y_base <= 200)，100% 锁定基准超分帧！
+                    if (yBase <= 200.0f) {
+                        pOut[x] = bSuper;
+                        continue;
+                    }
+
+                    // 2. 高光单向嫁接 Hermite smoothstep 权重: 200~245 平滑接入 HDR 高光细节
+                    float u = std::clamp((yBase - 200.0f) / 45.0f, 0.0f, 1.0f);
+                    float wHdr = u * u * (3.0f - 2.0f * u);
+
                     const cv::Vec3b& f = pFusedSmooth[x];
                     float yHdr = 0.114f * static_cast<float>(f[0]) + 0.587f * static_cast<float>(f[1]) + 0.299f * static_cast<float>(f[2]);
-                    float alphaHighlight = std::clamp((yHdr - 180.0f) / 60.0f, 0.0f, 1.0f);
+                    float alphaShort = std::clamp((yHdr - 210.0f) / 40.0f, 0.0f, 1.0f);
 
                     for (int c = 0; c < 3; ++c) {
-                        float dBase = static_cast<float>(pBaseSuper[x][c]) - static_cast<float>(pBaseSmooth[x][c]);
+                        float dBase = static_cast<float>(bSuper[c]) - static_cast<float>(pBaseSmooth[x][c]);
                         float dShort = 0.0f;
                         if (hasShortDetail) {
                             dShort = static_cast<float>(pShortSuper[x][c]) - static_cast<float>(pShortSmooth[x][c]);
                         }
-                        float detail = (1.0f - alphaHighlight) * dBase + alphaHighlight * dShort;
-                        pOut[x][c] = cv::saturate_cast<uchar>(static_cast<float>(f[c]) + detail);
+                        float detail = (1.0f - alphaShort) * dBase + alphaShort * dShort;
+                        float vHdr = static_cast<float>(f[c]) + detail;
+                        float vFinal = (1.0f - wHdr) * static_cast<float>(bSuper[c]) + wHdr * vHdr;
+                        pOut[x][c] = cv::saturate_cast<uchar>(vFinal);
                     }
                 }
             }
-            LOGI("50MP Two-Scale Frequency Super-Resolution HDR Fusion completed!");
+            LOGI("50MP Base-Locked Highlight Grafting HDR Fusion completed!");
         } else {
-            LOGI("MergeMertens: fewer than 2 aligned plates -> bypassing Mertens to preserve pristine 50MP base plate with ZERO ghosting");
-            superResult = I_base_50M;
+            LOGI("HDR Fusion: fewer than 2 aligned plates -> bypassing to preserve pristine 50MP base plate with ZERO ghosting");
+            superResult = I_base_50M.clone();
         }
 
 
@@ -1260,9 +1269,31 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         merger->process(platesSmall, fusedFloat);
         cv::Mat fusedSmall;
         fusedFloat.convertTo(fusedSmall, CV_8UC3, 255.0);
-        cv::resize(fusedSmall, result1x, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
+        cv::Mat fused1x;
+        cv::resize(fusedSmall, fused1x, cv::Size(cols, rows), 0, 0, cv::INTER_LINEAR);
+
+        result1x = cv::Mat(rows, cols, CV_8UC3);
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < rows; ++y) {
+            const cv::Vec3b* pBase = I_base_12M.ptr<cv::Vec3b>(y);
+            const cv::Vec3b* pFused = fused1x.ptr<cv::Vec3b>(y);
+            cv::Vec3b* pOut = result1x.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < cols; ++x) {
+                float yBase = 0.114f * pBase[x][0] + 0.587f * pBase[x][1] + 0.299f * pBase[x][2];
+                if (yBase <= 200.0f) {
+                    pOut[x] = pBase[x];
+                } else {
+                    float u = std::clamp((yBase - 200.0f) / 45.0f, 0.0f, 1.0f);
+                    float wHdr = u * u * (3.0f - 2.0f * u);
+                    for (int c = 0; c < 3; ++c) {
+                        float val = (1.0f - wHdr) * static_cast<float>(pBase[x][c]) + wHdr * static_cast<float>(pFused[x][c]);
+                        pOut[x][c] = cv::saturate_cast<uchar>(val);
+                    }
+                }
+            }
+        }
     } else {
-        result1x = I_base_12M;
+        result1x = I_base_12M.clone();
     }
 
     // S-curve toe damping
