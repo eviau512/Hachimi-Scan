@@ -109,8 +109,8 @@ class NativeEdgeDetector {
         }
     }
 
-    fun detectStructuralLines(bitmap: Bitmap): Pair<FloatArray, FloatArray> {
-        val arrays = nativeDetectStructuralLines(bitmap)
+    fun detectStructuralLines(bitmap: Bitmap, origWidth: Float = 0f, origHeight: Float = 0f): Pair<FloatArray, FloatArray> {
+        val arrays = nativeDetectStructuralLines(bitmap, origWidth, origHeight)
         val hLines = if (arrays.isNotEmpty()) arrays[0] else FloatArray(0)
         val vLines = if (arrays.size > 1) arrays[1] else FloatArray(0)
         return Pair(hLines, vLines)
@@ -127,7 +127,7 @@ class NativeEdgeDetector {
         maxOffset: Float
     ): Float
     private external fun nativeFindContourAtPoint(grayMatAddr: Long, touchX: Float, touchY: Float): FloatArray
-    private external fun nativeDetectStructuralLines(bitmap: Bitmap): Array<FloatArray>
+    private external fun nativeDetectStructuralLines(bitmap: Bitmap, origWidth: Float, origHeight: Float): Array<FloatArray>
 }
 
 

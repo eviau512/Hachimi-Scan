@@ -257,7 +257,9 @@ Java_com_scanner_app_engine_NativeEdgeDetector_nativeFindContourAtPoint(
 JNIEXPORT jobjectArray JNICALL
 Java_com_scanner_app_engine_NativeEdgeDetector_nativeDetectStructuralLines(
     JNIEnv* env, jobject /* this */,
-    jobject bitmap
+    jobject bitmap,
+    jfloat origWidth,
+    jfloat origHeight
 ) {
     jclass floatArrayClass = env->FindClass("[F");
     if (!bitmap) {
@@ -312,11 +314,14 @@ Java_com_scanner_app_engine_NativeEdgeDetector_nativeDetectStructuralLines(
         return result;
     }
 
+    float effectiveW = (origWidth > 0.0f) ? origWidth : static_cast<float>(info.width);
+    float effectiveH = (origHeight > 0.0f) ? origHeight : static_cast<float>(info.height);
+
     EdgeDetector detector;
     EdgeDetector::StructuralLinesResult linesResult = detector.detectStructuralLines(
         gray,
-        static_cast<float>(info.width),
-        static_cast<float>(info.height)
+        effectiveW,
+        effectiveH
     );
 
     jobjectArray result = env->NewObjectArray(2, floatArrayClass, nullptr);

@@ -76,12 +76,12 @@ class CropViewModel : ViewModel() {
 
     private var lsdJob: Job? = null
 
-    fun onBitmapLoaded(bitmap: Bitmap) {
+    fun onBitmapLoaded(bitmap: Bitmap, origW: Float = 0f, origH: Float = 0f) {
         lsdJob?.cancel()
         lsdJob = viewModelScope.launch(Dispatchers.Default) {
             try {
                 val detector = com.scanner.app.engine.NativeEdgeDetector()
-                val (hLines, vLines) = detector.detectStructuralLines(bitmap)
+                val (hLines, vLines) = detector.detectStructuralLines(bitmap, origW, origH)
                 _horizontalLines.value = hLines
                 _verticalLines.value = vLines
             } catch (e: Exception) {

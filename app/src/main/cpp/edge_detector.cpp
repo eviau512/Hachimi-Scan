@@ -198,6 +198,75 @@ DetectionResult EdgeDetector::detectDocument(const cv::Mat& grayFrame, bool curv
         }
     }
 
+    // 浅色桌面/低对比度边缘断裂自适应 Fallback 探测
+    if (bestScore <= 0.0) {
+        cv::Mat closeEdges;
+        cv::Mat bigKernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(11, 11));
+        cv::morphologyEx(edges, closeEdges, cv::MORPH_CLOSE, bigKernel);
+
+        std::vector<std::vector<cv::Point>> fallbackContours;
+        cv::findContours(closeEdges, fallbackContours, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
+        std::sort(fallbackContours.begin(), fallbackContours.end(), [](const std::vector<cv::Point>& a, const std::vector<cv::Point>& b) {
+            return cv::contourArea(a) > cv::contourArea(b);
+        });
+
+        for (const auto& contour : fallbackContours) {
+            double area = cv::contourArea(contour);
+            if (area < 0.05 * frameArea) break;
+            if (area > maxArea) continue;
+
+            std::vector<cv::Point> hull;
+            cv::convexHull(contour, hull);
+            double hullArea = cv::contourArea(hull);
+            if (hullArea < 0.05 * frameArea || hullArea > maxArea) continue;
+
+            double hullPerimeter = cv::arcLength(hull, true);
+            std::vector<cv::Point> approx;
+            for (double epsFactor : {0.02, 0.025, 0.03, 0.04, 0.05, 0.06}) {
+                cv::approxPolyDP(hull, approx, epsFactor * hullPerimeter, true);
+                if (approx.size() == 4) break;
+            }
+
+            if (approx.size() == 4 && cv::isContourConvex(approx)) {
+                bool validAngles = true;
+                for (int i = 0; i < 4; ++i) {
+                    cv::Point p0 = approx[i];
+                    cv::Point p1 = approx[(i + 1) % 4];
+                    cv::Point p2 = approx[(i + 2) % 4];
+                    cv::Point2f v1(static_cast<float>(p0.x - p1.x), static_cast<float>(p0.y - p1.y));
+                    cv::Point2f v2(static_cast<float>(p2.x - p1.x), static_cast<float>(p2.y - p1.y));
+                    double dot = v1.x * v2.x + v1.y * v2.y;
+                    double norm = std::hypot(v1.x, v1.y) * std::hypot(v2.x, v2.y);
+                    if (norm > 0) {
+                        double cosVal = dot / norm;
+                        if (std::abs(cosVal) > 0.85) { // 宽容至 ~32°~148°
+                            validAngles = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (validAngles) {
+                    cv::RotatedRect r = cv::minAreaRect(approx);
+                    float w = r.size.width;
+                    float h = r.size.height;
+                    if (w > 0.0f && h > 0.0f) {
+                        float ratio = std::max(w, h) / std::min(w, h);
+                        if (ratio <= 12.0f) {
+                            double rectArea = w * h;
+                            double rectangularity = (rectArea > 0) ? (hullArea / rectArea) : 0.0;
+                            if (rectangularity >= 0.65) {
+                                bestScore = rectangularity * (hullArea / frameArea);
+                                bestApprox = approx;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (bestScore > 0.0 && bestApprox.size() == 4) {
         std::vector<cv::Point2f> approxFloat;
         float invScale = (scale < 1.0f) ? (1.0f / scale) : 1.0f;
@@ -542,7 +611,7 @@ EdgeDetector::StructuralLinesResult EdgeDetector::detectStructuralLines(const cv
     float origW = (origWidth > 0.0f) ? origWidth : static_cast<float>(grayImage.cols);
     float origH = (origHeight > 0.0f) ? origHeight : static_cast<float>(grayImage.rows);
 
-    float maxDim = std::max(origW, origH);
+    float maxDim = std::max(grayImage.cols, grayImage.rows);
     float scale = 1.0f;
     cv::Mat lsdInput;
 
@@ -557,19 +626,22 @@ EdgeDetector::StructuralLinesResult EdgeDetector::detectStructuralLines(const cv
     std::vector<cv::Vec4f> detectedLines;
     lsd->detect(lsdInput, detectedLines);
 
-    const float MIN_LENGTH = 25.0f;
+    // 将 lsdInput 坐标系统直接映射至原图坐标系 (origW, origH)
+    float scaleX = origW / static_cast<float>(lsdInput.cols);
+    float scaleY = origH / static_cast<float>(lsdInput.rows);
+    float minLength = 0.015f * std::min(origW, origH);
 
     for (const auto& line : detectedLines) {
-        float x1 = line[0] / scale;
-        float y1 = line[1] / scale;
-        float x2 = line[2] / scale;
-        float y2 = line[3] / scale;
+        float x1 = line[0] * scaleX;
+        float y1 = line[1] * scaleY;
+        float x2 = line[2] * scaleX;
+        float y2 = line[3] * scaleY;
 
         float dx = std::abs(x2 - x1);
         float dy = std::abs(y2 - y1);
         float len = std::hypot(dx, dy);
 
-        if (len < MIN_LENGTH) {
+        if (len < minLength) {
             continue;
         }
 

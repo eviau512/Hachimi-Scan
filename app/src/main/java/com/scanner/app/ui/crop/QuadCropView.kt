@@ -45,6 +45,11 @@ private data class Line2D(
         return abs(a * pt.x + b * pt.y + c)
     }
 
+    fun project(pt: PointF): PointF {
+        val d = a * pt.x + b * pt.y + c
+        return PointF(pt.x - a * d, pt.y - b * d)
+    }
+
     companion object {
         fun fromPoints(p1: PointF, p2: PointF): Line2D {
             val dx = p2.x - p1.x
@@ -67,6 +72,28 @@ private data class Line2D(
             return PointF(x, y)
         }
     }
+}
+
+private fun pointToSegmentDistance(
+    px: Float, py: Float,
+    x1: Float, y1: Float,
+    x2: Float, y2: Float,
+    allowExtension: Boolean = true
+): Float {
+    val dx = x2 - x1
+    val dy = y2 - y1
+    val lenSq = dx * dx + dy * dy
+    if (lenSq < 1e-6f) return hypot(px - x1, py - y1)
+    val t = ((px - x1) * dx + (py - y1) * dy) / lenSq
+    if (allowExtension) {
+        if (t < -0.25f || t > 1.25f) return Float.MAX_VALUE
+    } else {
+        if (t < 0f || t > 1f) return Float.MAX_VALUE
+    }
+    val tClamped = t.coerceIn(0f, 1f)
+    val projX = x1 + tClamped * dx
+    val projY = y1 + tClamped * dy
+    return hypot(px - projX, py - projY)
 }
 
 private fun isConvexQuad(quad: DocumentQuad, bmpW: Float, bmpH: Float): Boolean {
@@ -131,7 +158,7 @@ fun QuadCropView(
     var touchPosition by remember { mutableStateOf(Offset.Zero) }
     var wasSnapped by remember { mutableStateOf(false) }
     var isEdgeSnapped by remember { mutableStateOf(false) }
-    var activeSnapGuide by remember { mutableStateOf<SnapGuide?>(null) }
+    var activeSnapGuides by remember { mutableStateOf<List<SnapGuide>>(emptyList()) }
 
     var dragBaseQuad by remember { mutableStateOf<DocumentQuad?>(null) }
     var dragTotalOffset by remember { mutableStateOf(Offset.Zero) }
@@ -260,7 +287,7 @@ fun QuadCropView(
                             dragTotalOffset = Offset.Zero
                             wasSnapped = false
                             isEdgeSnapped = false
-                            activeSnapGuide = null
+                            activeSnapGuides = emptyList()
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         } else {
                             draggingHandleIndex = null
@@ -272,7 +299,7 @@ fun QuadCropView(
                         dragTotalOffset = Offset.Zero
                         wasSnapped = false
                         isEdgeSnapped = false
-                        activeSnapGuide = null
+                        activeSnapGuides = emptyList()
                     },
                     onDragCancel = {
                         draggingHandleIndex = null
@@ -280,7 +307,7 @@ fun QuadCropView(
                         dragTotalOffset = Offset.Zero
                         wasSnapped = false
                         isEdgeSnapped = false
-                        activeSnapGuide = null
+                        activeSnapGuides = emptyList()
                     },
                     onDrag = { change, dragAmount ->
                         change.consume()
@@ -304,6 +331,10 @@ fun QuadCropView(
                         val totalDeltaX = dragTotalOffset.x / scale
                         val totalDeltaY = dragTotalOffset.y / scale
 
+                        // Dynamic Screen-Space Snapping Threshold (28dp converted to image pixels)
+                        val snapThresholdPx = with(density) { 28.dp.toPx() }
+                        val tauSnap = snapThresholdPx / scale
+
                         if (handleIdx % 2 != 0) {
                             // --- MIDPOINT DRAGGING (SPEC_06 §4 & §5) ---
                             // 1: Left-Center, 3: Bottom-Center, 5: Right-Center, 7: Top-Center
@@ -320,12 +351,10 @@ fun QuadCropView(
                                 (baseMid.y + totalDeltaY).coerceIn(0f, fullH)
                             )
 
-                            // Degenerate Triangle Snapping (SPEC_06 §4.1)
-                            // epsilon(M, AB) = |dist(A, M) + dist(M, B) - dist(A, B)| < 5.0px
-                            var bestEpsilon = Float.MAX_VALUE
+                            // Point-to-segment perpendicular distance snapping
+                            var bestDist = tauSnap
                             var bestLineA: PointF? = null
                             var bestLineB: PointF? = null
-                            val tauSnap = 5.0f
 
                             var i = 0
                             while (i + 3 < pool.size) {
@@ -335,13 +364,9 @@ fun QuadCropView(
                                 val by = pool[i + 3]
                                 i += 4
 
-                                val distAM = hypot(ax - curMid.x, ay - curMid.y)
-                                val distMB = hypot(bx - curMid.x, by - curMid.y)
-                                val distAB = hypot(bx - ax, by - ay)
-
-                                val eps = abs(distAM + distMB - distAB)
-                                if (eps < tauSnap && eps < bestEpsilon) {
-                                    bestEpsilon = eps
+                                val d = pointToSegmentDistance(curMid.x, curMid.y, ax, ay, bx, by, allowExtension = true)
+                                if (d < bestDist) {
+                                    bestDist = d
                                     bestLineA = PointF(ax, ay)
                                     bestLineB = PointF(bx, by)
                                 }
@@ -419,27 +444,96 @@ fun QuadCropView(
                             }
                             wasSnapped = didSnap
                             isEdgeSnapped = didSnap
-                            activeSnapGuide = if (didSnap) SnapGuide(bestLineA!!, bestLineB!!) else null
+                            activeSnapGuides = if (didSnap) listOf(SnapGuide(bestLineA!!, bestLineB!!)) else emptyList()
                         } else {
                             // --- CORNER DRAGGING (SPEC_06 §6.1) ---
                             // 0: TOP_LEFT, 2: BOTTOM_LEFT, 4: BOTTOM_RIGHT, 6: TOP_RIGHT
                             val rawImgX = ((touchPosition.x - offsetX) / scale).coerceIn(0f, fullW)
                             val rawImgY = ((touchPosition.y - offsetY) / scale).coerceIn(0f, fullH)
 
-                            var imgX = rawImgX
-                            var imgY = rawImgY
-                            val snapDist = 12f
-                            if (abs(imgX - 0f) < snapDist) imgX = 0f
-                            if (abs(imgX - fullW) < snapDist) imgX = fullW
-                            if (abs(imgY - 0f) < snapDist) imgY = 0f
-                            if (abs(imgY - fullH) < snapDist) imgY = fullH
+                            // Search for nearest horizontal line
+                            var bestHDist = tauSnap
+                            var bestHLineA: PointF? = null
+                            var bestHLineB: PointF? = null
+                            var hIdx = 0
+                            while (hIdx + 3 < currentHorizontalLines.size) {
+                                val ax = currentHorizontalLines[hIdx]
+                                val ay = currentHorizontalLines[hIdx + 1]
+                                val bx = currentHorizontalLines[hIdx + 2]
+                                val by = currentHorizontalLines[hIdx + 3]
+                                hIdx += 4
+                                val d = pointToSegmentDistance(rawImgX, rawImgY, ax, ay, bx, by, allowExtension = true)
+                                if (d < bestHDist) {
+                                    bestHDist = d
+                                    bestHLineA = PointF(ax, ay)
+                                    bestHLineB = PointF(bx, by)
+                                }
+                            }
 
-                            val newPt = PointF(imgX, imgY)
+                            // Search for nearest vertical line
+                            var bestVDist = tauSnap
+                            var bestVLineA: PointF? = null
+                            var bestVLineB: PointF? = null
+                            var vIdx = 0
+                            while (vIdx + 3 < currentVerticalLines.size) {
+                                val ax = currentVerticalLines[vIdx]
+                                val ay = currentVerticalLines[vIdx + 1]
+                                val bx = currentVerticalLines[vIdx + 2]
+                                val by = currentVerticalLines[vIdx + 3]
+                                vIdx += 4
+                                val d = pointToSegmentDistance(rawImgX, rawImgY, ax, ay, bx, by, allowExtension = true)
+                                if (d < bestVDist) {
+                                    bestVDist = d
+                                    bestVLineA = PointF(ax, ay)
+                                    bestVLineB = PointF(bx, by)
+                                }
+                            }
+
+                            var snappedPt = PointF(rawImgX, rawImgY)
+                            var didSnap = false
+                            val guides = mutableListOf<SnapGuide>()
+
+                            if (bestHLineA != null && bestVLineA != null) {
+                                val lH = Line2D.fromPoints(bestHLineA, bestHLineB!!)
+                                val lV = Line2D.fromPoints(bestVLineA, bestVLineB!!)
+                                val intersection = Line2D.intersect(lH, lV)
+                                if (intersection != null && hypot(intersection.x - rawImgX, intersection.y - rawImgY) < tauSnap * 1.5f) {
+                                    snappedPt = PointF(intersection.x.coerceIn(0f, fullW), intersection.y.coerceIn(0f, fullH))
+                                    didSnap = true
+                                    guides.add(SnapGuide(bestHLineA, bestHLineB))
+                                    guides.add(SnapGuide(bestVLineA, bestVLineB))
+                                } else {
+                                    if (bestHDist <= bestVDist) {
+                                        val proj = lH.project(PointF(rawImgX, rawImgY))
+                                        snappedPt = PointF(proj.x.coerceIn(0f, fullW), proj.y.coerceIn(0f, fullH))
+                                        didSnap = true
+                                        guides.add(SnapGuide(bestHLineA, bestHLineB))
+                                    } else {
+                                        val proj = lV.project(PointF(rawImgX, rawImgY))
+                                        snappedPt = PointF(proj.x.coerceIn(0f, fullW), proj.y.coerceIn(0f, fullH))
+                                        didSnap = true
+                                        guides.add(SnapGuide(bestVLineA, bestVLineB))
+                                    }
+                                }
+                            } else if (bestHLineA != null) {
+                                val lH = Line2D.fromPoints(bestHLineA, bestHLineB!!)
+                                val proj = lH.project(PointF(rawImgX, rawImgY))
+                                snappedPt = PointF(proj.x.coerceIn(0f, fullW), proj.y.coerceIn(0f, fullH))
+                                didSnap = true
+                                guides.add(SnapGuide(bestHLineA, bestHLineB))
+                            } else if (bestVLineA != null) {
+                                val lV = Line2D.fromPoints(bestVLineA, bestVLineB!!)
+                                val proj = lV.project(PointF(rawImgX, rawImgY))
+                                snappedPt = PointF(proj.x.coerceIn(0f, fullW), proj.y.coerceIn(0f, fullH))
+                                didSnap = true
+                                guides.add(SnapGuide(bestVLineA, bestVLineB))
+                            }
+
                             val tentativeQuad = when (handleIdx) {
-                                0 -> activeQuad.copy(topLeft = newPt)
-                                2 -> activeQuad.copy(bottomLeft = newPt)
-                                4 -> activeQuad.copy(bottomRight = newPt)
-                                else -> activeQuad.copy(topRight = newPt) // 6
+                                0 -> activeQuad.copy(topLeft = snappedPt)
+                                2 -> activeQuad.copy(bottomLeft = snappedPt)
+                                4 -> activeQuad.copy(bottomRight = snappedPt)
+                                else -> activeQuad.copy(topRight = snappedPt) // 6
                             }
 
                             if (isConvexQuad(tentativeQuad, fullW, fullH)) {
@@ -453,13 +547,16 @@ fun QuadCropView(
                                 if (onQuadChangedCb != null) {
                                     onQuadChangedCb(tentativeQuad)
                                 } else {
-                                    currentOnCornerUpdated(cornerIndex, newPt)
+                                    currentOnCornerUpdated(cornerIndex, snappedPt)
                                 }
                             }
 
-                            wasSnapped = false
-                            isEdgeSnapped = false
-                            activeSnapGuide = null
+                            if (didSnap && !wasSnapped) {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            }
+                            wasSnapped = didSnap
+                            isEdgeSnapped = didSnap
+                            activeSnapGuides = guides
                         }
                     }
                 )
@@ -507,8 +604,8 @@ fun QuadCropView(
                 )
             }
 
-            // 3. Alignment Snap Guide Line
-            activeSnapGuide?.let { guide ->
+            // 3. Alignment Snap Guide Lines
+            activeSnapGuides.forEach { guide ->
                 val gStart = imgToScreen(guide.start)
                 val gEnd = imgToScreen(guide.end)
                 drawLine(
@@ -635,10 +732,17 @@ fun QuadCropView(
             }
 
             // 6. Draw 4 Corner Handles
-            screenCorners.forEach { corner ->
+            val cornerHandleIndices = listOf(0, 6, 4, 2)
+            screenCorners.forEachIndexed { idx, corner ->
+                val handleIdx = cornerHandleIndices[idx]
+                val isThisCornerDragging = (draggingHandleIndex == handleIdx)
+                val isThisCornerSnapped = (isThisCornerDragging && isEdgeSnapped)
+                val cornerColor = if (isThisCornerSnapped) snapGreen else themeTeal
+                val cornerBorderColor = if (isThisCornerSnapped) snapGreen else Color.White
+
                 drawCircle(color = Color.Black.copy(alpha = 0.4f), radius = cornerHandleRadiusPx + 3.dp.toPx(), center = corner)
-                drawCircle(color = Color.White, radius = cornerHandleRadiusPx + 1.5.dp.toPx(), center = corner)
-                drawCircle(color = themeTeal, radius = cornerHandleRadiusPx, center = corner)
+                drawCircle(color = cornerBorderColor, radius = cornerHandleRadiusPx + 1.5.dp.toPx(), center = corner)
+                drawCircle(color = cornerColor, radius = cornerHandleRadiusPx, center = corner)
                 drawCircle(color = Color.White, radius = cornerHandleRadiusPx * 0.35f, center = corner)
             }
 
@@ -684,15 +788,17 @@ fun QuadCropView(
                     nativeCanvas.restore()
                 }
 
+                val loupeColor = if (isEdgeSnapped) snapGreen else themeTeal
+
                 // Loupe outer chrome rings
                 drawCircle(
-                    color = Color.White,
+                    color = if (isEdgeSnapped) snapGreen else Color.White,
                     radius = magRadiusPx + 3.dp.toPx(),
                     center = loupeCenter,
                     style = Stroke(width = 3.dp.toPx())
                 )
                 drawCircle(
-                    color = themeTeal,
+                    color = loupeColor,
                     radius = magRadiusPx + 1.dp.toPx(),
                     center = loupeCenter,
                     style = Stroke(width = 1.5.dp.toPx())
@@ -758,7 +864,7 @@ fun QuadCropView(
                 )
 
                 // Center tiny target dot
-                drawCircle(color = themeTeal, radius = 2.5.dp.toPx(), center = loupeCenter)
+                drawCircle(color = loupeColor, radius = 2.5.dp.toPx(), center = loupeCenter)
             }
         }
     }

@@ -282,9 +282,9 @@ fun CropScreen(
                 }
             }
 
-            LaunchedEffect(bitmap) {
+            LaunchedEffect(bitmap, origW, origH) {
                 if (bitmap != null) {
-                    viewModel.onBitmapLoaded(bitmap)
+                    viewModel.onBitmapLoaded(bitmap, origW, origH)
                 }
             }
 
