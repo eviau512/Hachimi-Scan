@@ -259,65 +259,188 @@ bool BurstFusionEngine::alignHighlightTemplate(const cv::Mat& srcShort, const cv
     int R = std::min(70, std::min(sCols, sRows) / 10);
     int M = 45;
 
-    int px = maxLoc.x;
-    int py = maxLoc.y;
+    // 1. 提取所有显著发光高光峰值候选 (Connected Components + Local Maxima)
+    double threshVal = std::max(18.0, maxVal * 0.35);
+    cv::Mat threshMask;
+    cv::threshold(blurShort, threshMask, threshVal, 255.0, cv::THRESH_BINARY);
+    threshMask.convertTo(threshMask, CV_8UC1);
 
-    if (px - R - M < 0 || px + R + M >= sCols || py - R - M < 0 || py + R + M >= sRows) {
-        return false;
-    }
+    cv::Mat labels, stats, centroids;
+    int nLabels = cv::connectedComponentsWithStats(threshMask, labels, stats, centroids);
 
-    cv::Rect templRect(px - R, py - R, 2 * R, 2 * R);
-    cv::Rect searchRect(px - R - M, py - R - M, 2 * R + 2 * M, 2 * R + 2 * M);
+    struct PeakCandidate {
+        cv::Point pt;
+        double maxVal;
+        int area;
+    };
+    std::vector<PeakCandidate> candidates;
 
-    cv::Mat templ = sShort(templRect);
-    cv::Mat searchRoi = sBase(searchRect);
+    for (int i = 1; i < nLabels; ++i) {
+        int area = stats.at<int>(i, cv::CC_STAT_AREA);
+        if (area < 15) continue;
 
-    cv::Mat matchResult;
-    cv::matchTemplate(searchRoi, templ, matchResult, cv::TM_CCOEFF_NORMED);
+        cv::Mat compMask = (labels == i);
+        double cMin, cMax;
+        cv::Point cMinLoc, cMaxLoc;
+        cv::minMaxLoc(blurShort, &cMin, &cMax, &cMinLoc, &cMaxLoc, compMask);
 
-    double minV, maxV;
-    cv::Point minL, maxL;
-    cv::minMaxLoc(matchResult, &minV, &maxV, &minL, &maxL);
-
-    LOGI("alignHighlightTemplate: peak=(%d,%d), maxVal=%.1f, matchScore=%.4f at (%d,%d)",
-         px, py, maxVal, maxV, maxL.x, maxL.y);
-
-    if (maxV < 0.35) {
-        return false;
-    }
-
-    double intDx = static_cast<double>(maxL.x - M);
-    double intDy = static_cast<double>(maxL.y - M);
-
-    int mx = maxL.x;
-    int my = maxL.y;
-    double subDx = intDx;
-    double subDy = intDy;
-
-    if (mx > 0 && mx < matchResult.cols - 1) {
-        double denom = matchResult.at<float>(my, mx - 1) - 2.0 * matchResult.at<float>(my, mx) + matchResult.at<float>(my, mx + 1);
-        if (std::abs(denom) > 1e-5) {
-            subDx += (matchResult.at<float>(my, mx - 1) - matchResult.at<float>(my, mx + 1)) / (2.0 * denom);
+        int px = cMaxLoc.x;
+        int py = cMaxLoc.y;
+        if (px - R - M >= 0 && px + R + M < sCols && py - R - M >= 0 && py + R + M < sRows) {
+            candidates.push_back({cMaxLoc, cMax, area});
         }
     }
-    if (my > 0 && my < matchResult.rows - 1) {
-        double denom = matchResult.at<float>(my - 1, mx) - 2.0 * matchResult.at<float>(my, mx) + matchResult.at<float>(my + 1, mx);
-        if (std::abs(denom) > 1e-5) {
-            subDy += (matchResult.at<float>(my - 1, mx) - matchResult.at<float>(my + 1, mx)) / (2.0 * denom);
+
+    // 按峰值亮度与面积降序排序
+    std::sort(candidates.begin(), candidates.end(), [](const PeakCandidate& a, const PeakCandidate& b) {
+        if (std::abs(a.maxVal - b.maxVal) > 5.0) return a.maxVal > b.maxVal;
+        return a.area > b.area;
+    });
+
+    // 空间非极大值抑制 (NMS): 过滤相互重叠的临近峰值
+    std::vector<PeakCandidate> selectedPeaks;
+    for (const auto& p : candidates) {
+        bool tooClose = false;
+        for (const auto& sp : selectedPeaks) {
+            double dist = std::hypot(p.pt.x - sp.pt.x, p.pt.y - sp.pt.y);
+            if (dist < 2.0 * R) {
+                tooClose = true;
+                break;
+            }
         }
+        if (!tooClose) {
+            selectedPeaks.push_back(p);
+            if (selectedPeaks.size() >= 8) break; // 最多匹配 8 个显著发光光源
+        }
+    }
+
+    // 若连通域未筛选出有效峰值，则使用全局最大值兜底
+    if (selectedPeaks.empty()) {
+        int px = maxLoc.x;
+        int py = maxLoc.y;
+        if (px - R - M >= 0 && px + R + M < sCols && py - R - M >= 0 && py + R + M < sRows) {
+            selectedPeaks.push_back({maxLoc, maxVal, 100});
+        } else {
+            return false;
+        }
+    }
+
+    // 2. 对每个独立发光光源执行 NCC 归一化互相关匹配与亚像素插值
+    std::vector<cv::Point2f> srcPts;
+    std::vector<cv::Point2f> dstPts;
+    std::vector<double> matchScores;
+    std::vector<cv::Point2d> displacements;
+
+    for (const auto& peak : selectedPeaks) {
+        int px = peak.pt.x;
+        int py = peak.pt.y;
+
+        cv::Rect templRect(px - R, py - R, 2 * R, 2 * R);
+        cv::Rect searchRect(px - R - M, py - R - M, 2 * R + 2 * M, 2 * R + 2 * M);
+
+        cv::Mat templ = sShort(templRect);
+        cv::Mat searchRoi = sBase(searchRect);
+
+        cv::Mat matchResult;
+        cv::matchTemplate(searchRoi, templ, matchResult, cv::TM_CCOEFF_NORMED);
+
+        double minV, maxV;
+        cv::Point minL, maxL;
+        cv::minMaxLoc(matchResult, &minV, &maxV, &minL, &maxL);
+
+        if (maxV >= 0.35) {
+            double intDx = static_cast<double>(maxL.x - M);
+            double intDy = static_cast<double>(maxL.y - M);
+
+            int mx = maxL.x;
+            int my = maxL.y;
+            double subDx = intDx;
+            double subDy = intDy;
+
+            if (mx > 0 && mx < matchResult.cols - 1) {
+                double denom = matchResult.at<float>(my, mx - 1) - 2.0 * matchResult.at<float>(my, mx) + matchResult.at<float>(my, mx + 1);
+                if (std::abs(denom) > 1e-5) {
+                    subDx += (matchResult.at<float>(my, mx - 1) - matchResult.at<float>(my, mx + 1)) / (2.0 * denom);
+                }
+            }
+            if (my > 0 && my < matchResult.rows - 1) {
+                double denom = matchResult.at<float>(my - 1, mx) - 2.0 * matchResult.at<float>(my, mx) + matchResult.at<float>(my + 1, mx);
+                if (std::abs(denom) > 1e-5) {
+                    subDy += (matchResult.at<float>(my - 1, mx) - matchResult.at<float>(my + 1, mx)) / (2.0 * denom);
+                }
+            }
+
+            srcPts.emplace_back(static_cast<float>(px), static_cast<float>(py));
+            dstPts.emplace_back(static_cast<float>(px + subDx), static_cast<float>(py + subDy));
+            matchScores.push_back(maxV);
+            displacements.emplace_back(subDx, subDy);
+
+            LOGI("alignHighlightTemplate: matched light peak at (%d,%d), maxVal=%.1f, score=%.4f, dx=%.2f, dy=%.2f",
+                 px, py, peak.maxVal, maxV, subDx, subDy);
+        }
+    }
+
+    if (srcPts.empty()) {
+        return false;
     }
 
     float invScale = (scale < 1.0f) ? (1.0f / scale) : 1.0f;
-    double fullDx = subDx * invScale;
-    double fullDy = subDy * invScale;
+    bool fitSuccess = false;
 
-    LOGI("alignHighlightTemplate: final subpixel displacement dx=%.2f, dy=%.2f", fullDx, fullDy);
+    // 3. 变换矩阵估计：多光源时估计 4 自由度刚体变换 (平移+旋转)，单光源时使用纯平移
+    if (srcPts.size() >= 2) {
+        cv::Mat inliers;
+        cv::Mat M = cv::estimateAffinePartial2D(srcPts, dstPts, inliers, cv::RANSAC, 3.0);
+        if (!M.empty() && M.rows == 2 && M.cols == 3) {
+            double a00 = M.at<double>(0, 0);
+            double a01 = M.at<double>(0, 1);
+            double a10 = M.at<double>(1, 0);
+            double a11 = M.at<double>(1, 1);
+            double tx = M.at<double>(0, 2);
+            double ty = M.at<double>(1, 2);
 
-    if (std::abs(fullDx) <= 50.0 && std::abs(fullDy) <= 50.0) {
-        outH = (cv::Mat_<double>(3, 3) <<
-            1.0, 0.0, fullDx,
-            0.0, 1.0, fullDy,
-            0.0, 0.0, 1.0);
+            double s = std::sqrt(a00 * a00 + a01 * a01);
+            double theta = std::atan2(a10, a00);
+            double transDist = std::hypot(tx, ty);
+
+            // 物理自检: 手持连续曝光 burst 旋转角 < 5度, 缩放 0.95~1.05, 平移 <= 45px (在 downscale 尺度下)
+            if (s >= 0.95 && s <= 1.05 && std::abs(theta) < 0.087 && transDist <= 45.0) {
+                outH = (cv::Mat_<double>(3, 3) <<
+                    a00, a01, tx * invScale,
+                    a10, a11, ty * invScale,
+                    0.0, 0.0, 1.0);
+                fitSuccess = true;
+                LOGI("alignHighlightTemplate: fitted Multi-Peak Rigid Affine: s=%.4f, rot=%.3f deg, tx=%.2f, ty=%.2f",
+                     s, theta * 180.0 / CV_PI, tx * invScale, ty * invScale);
+            }
+        }
+    }
+
+    if (!fitSuccess) {
+        // 单光源或刚体拟合退化: 选择最高置信度的光源位移作为全局平移
+        size_t bestIdx = 0;
+        double bestScore = -1.0;
+        for (size_t i = 0; i < matchScores.size(); ++i) {
+            if (matchScores[i] > bestScore) {
+                bestScore = matchScores[i];
+                bestIdx = i;
+            }
+        }
+        double fullDx = displacements[bestIdx].x * invScale;
+        double fullDy = displacements[bestIdx].y * invScale;
+        LOGI("alignHighlightTemplate: single/best-peak translation: dx=%.2f, dy=%.2f, score=%.4f",
+             fullDx, fullDy, bestScore);
+
+        if (std::hypot(fullDx, fullDy) <= 120.0) {
+            outH = (cv::Mat_<double>(3, 3) <<
+                1.0, 0.0, fullDx,
+                0.0, 1.0, fullDy,
+                0.0, 0.0, 1.0);
+            fitSuccess = true;
+        }
+    }
+
+    if (fitSuccess) {
         cv::warpPerspective(srcShort, outWarped, outH, refBase.size(),
                             cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         return true;
@@ -642,6 +765,13 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                     aligned = true;
                     LOGI("Tier 3 Frame 0 directly aligned to Tier 1");
                 }
+            }
+            if (aligned && !H_short0.empty() && H_short0.rows == 3 && H_short0.cols == 3) {
+                double a00 = H_short0.at<double>(0, 0);
+                double a10 = H_short0.at<double>(1, 0);
+                double rotDeg = std::atan2(a10, a00) * 180.0 / CV_PI;
+                LOGI("Tier 3 H_short0 composite transform: rot=%.3f deg, tx=%.2f, ty=%.2f",
+                     rotDeg, H_short0.at<double>(0, 2), H_short0.at<double>(1, 2));
             }
             if (!aligned) {
                 H_short0 = cv::Mat::eye(3, 3, CV_64F);
