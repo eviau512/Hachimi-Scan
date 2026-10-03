@@ -12,6 +12,130 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ============================================================================
+// [SPEC_02 §2.4 / v23] 对齐校验辅助函数
+// 1. maxDisplacement: 位移场 (中心+四角) 最大位移，取代对矩阵平移分量 (绕原点旋转时失真) 的硬上限
+// 2. alignmentScores / verifyAlignment: 半分辨率高通 ZNCC 结构校验，取代固定像素物理熔断
+// ============================================================================
+static double maxDisplacement(const cv::Mat& H, int rows, int cols) {
+    if (H.empty() || H.rows != 3 || H.cols != 3) return 1e9;
+    cv::Mat Hd;
+    H.convertTo(Hd, CV_64F);
+    const cv::Point2d pts[5] = {
+        {cols * 0.5, rows * 0.5}, {0.0, 0.0}, {static_cast<double>(cols), 0.0},
+        {0.0, static_cast<double>(rows)}, {static_cast<double>(cols), static_cast<double>(rows)}
+    };
+    double m = 0.0;
+    for (const auto& p : pts) {
+        double x = Hd.at<double>(0, 0) * p.x + Hd.at<double>(0, 1) * p.y + Hd.at<double>(0, 2);
+        double y = Hd.at<double>(1, 0) * p.x + Hd.at<double>(1, 1) * p.y + Hd.at<double>(1, 2);
+        double w = Hd.at<double>(2, 0) * p.x + Hd.at<double>(2, 1) * p.y + Hd.at<double>(2, 2);
+        if (std::abs(w) < 1e-9) return 1e9;
+        m = std::max(m, std::hypot(x / w - p.x, y / w - p.y));
+    }
+    return m;
+}
+
+static bool displacementWithinLimit(const cv::Mat& H, int rows, int cols, const char* tag) {
+    double limit = 0.08 * static_cast<double>(std::max(rows, cols));
+    double d = maxDisplacement(H, rows, cols);
+    if (d > limit) {
+        LOGW("%s: displacement field max=%.1fpx > limit %.1fpx -> rejected", tag, d, limit);
+        return false;
+    }
+    return true;
+}
+
+static bool alignmentScores(const cv::Mat& src, const cv::Mat& ref, const cv::Mat& H,
+                            double& zH, double& zI, double& lumaRatio) {
+    try {
+        int maxDim = std::max(ref.cols, ref.rows);
+        double s = (maxDim > 2048) ? 2048.0 / maxDim : 1.0;
+        cv::Mat gs, gr;
+        if (src.channels() == 3) cv::cvtColor(src, gs, cv::COLOR_BGR2GRAY); else gs = src;
+        if (ref.channels() == 3) cv::cvtColor(ref, gr, cv::COLOR_BGR2GRAY); else gr = ref;
+        if (s < 1.0) {
+            cv::resize(gs, gs, cv::Size(), s, s, cv::INTER_AREA);
+            cv::resize(gr, gr, cv::Size(), s, s, cv::INTER_AREA);
+        }
+        cv::Mat Hd;
+        H.convertTo(Hd, CV_64F);
+        cv::Mat S = (cv::Mat_<double>(3, 3) << s, 0, 0, 0, s, 0, 0, 0, 1);
+        cv::Mat Si = (cv::Mat_<double>(3, 3) << 1.0 / s, 0, 0, 0, 1.0 / s, 0, 0, 0, 1);
+        cv::Mat Hs = S * Hd * Si;
+
+        auto highPass = [](const cv::Mat& g) {
+            cv::Mat f, a, b;
+            g.convertTo(f, CV_32F);
+            cv::GaussianBlur(f, a, cv::Size(0, 0), 1.2);
+            cv::GaussianBlur(f, b, cv::Size(0, 0), 5.0);
+            return cv::Mat(a - b);
+        };
+        cv::Mat hpRef = highPass(gr);
+        cv::Mat hpSrc = highPass(gs);
+
+        cv::Mat hpWarp, gsWarp, ones(gs.size(), CV_8U, cv::Scalar(255)), vmask;
+        cv::warpPerspective(hpSrc, hpWarp, Hs, gr.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
+        cv::warpPerspective(gs, gsWarp, Hs, gr.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
+        cv::warpPerspective(ones, vmask, Hs, gr.size(), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+
+        auto zncc = [](const cv::Mat& a, const cv::Mat& b, const cv::Mat& mask) {
+            if (cv::countNonZero(mask) < 1000) return -1.0;
+            cv::Scalar ma, sa, mb, sb;
+            cv::meanStdDev(a, ma, sa, mask);
+            cv::meanStdDev(b, mb, sb, mask);
+            double mab = cv::mean(a.mul(b), mask)[0];
+            return (mab - ma[0] * mb[0]) / (sa[0] * sb[0] + 1e-6);
+        };
+
+        cv::Mat refOk = (gr >= 4) & (gr <= 250);
+        cv::Mat warpOk = (gsWarp >= 4) & (gsWarp <= 250) & (vmask > 0) & refOk;
+        cv::Mat idOk = (gs >= 4) & (gs <= 250) & refOk;
+        zH = zncc(hpWarp, hpRef, warpOk);
+        zI = zncc(hpSrc, hpRef, idOk);
+        double mRef = cv::mean(gr, warpOk)[0];
+        double mSrc = cv::mean(gsWarp, warpOk)[0];
+        lumaRatio = (mRef > 1.0) ? (mSrc / mRef) : 1.0;
+        return true;
+    } catch (const std::exception& e) {
+        LOGW("alignmentScores exception: %s", e.what());
+        return false;
+    }
+}
+
+// 同曝光对：高通 ZNCC 必须显著为正且不劣于“不对齐”；跨曝光对：仅记录，交由对齐器自身置信度裁决
+static bool verifyAlignment(const cv::Mat& src, const cv::Mat& ref, const cv::Mat& H, const char* tag) {
+    double zH = 0.0, zI = 0.0, ratio = 1.0;
+    if (!alignmentScores(src, ref, H, zH, zI, ratio)) return true;
+    bool sameExposure = (ratio >= 0.7 && ratio <= 1.4);
+    // 绝对下限极低 (纯噪声互相关≈0)；位移 > 2px 的变换必须严格优于“不对齐”才可接受
+    double moved = maxDisplacement(H, ref.rows, ref.cols);
+    bool ok = !sameExposure || (zH >= 0.03 && zH >= zI - 0.01 && (moved <= 2.0 || zH >= zI + 0.02));
+    LOGI("verify[%s]: hp-zncc=%.3f identity=%.3f moved=%.1fpx lumaRatio=%.2f sameExposure=%d -> %s",
+         tag, zH, zI, moved, ratio, sameExposure ? 1 : 0, ok ? "ACCEPT" : "REJECT");
+    return ok;
+}
+
+// 鲁棒亮度噪声 σ 估计：相邻像素差绝对值的中位数 / 0.954 (高斯噪声 median|d| = 0.6745·σ·√2)，不受文字边缘影响
+static float estimateLumaNoiseSigma(const cv::Mat& bgr) {
+    if (bgr.empty() || bgr.channels() != 3) return 4.0f;
+    std::vector<uchar> diffs;
+    diffs.reserve((bgr.rows / 3 + 1) * (bgr.cols / 3 + 1));
+    for (int y = 0; y < bgr.rows; y += 3) {
+        const cv::Vec3b* p = bgr.ptr<cv::Vec3b>(y);
+        for (int x = 0; x + 1 < bgr.cols; x += 3) {
+            int a = (29 * p[x][0] + 150 * p[x][1] + 77 * p[x][2]) >> 8;
+            int b = (29 * p[x + 1][0] + 150 * p[x + 1][1] + 77 * p[x + 1][2]) >> 8;
+            diffs.push_back(static_cast<uchar>(std::abs(a - b)));
+        }
+    }
+    if (diffs.size() < 100) return 4.0f;
+    size_t mid = diffs.size() / 2;
+    std::nth_element(diffs.begin(), diffs.begin() + mid, diffs.end());
+    return static_cast<float>(diffs[mid]) / 0.954f;
+}
+
+
+// ============================================================================
 // 第一级：全局单应性粗配准 (ORB + RANSAC Homography)
 // ============================================================================
 bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& ref, cv::Mat& outWarped, cv::Mat& outH) {
@@ -95,10 +219,11 @@ bool BurstFusionEngine::alignFrameHomography(const cv::Mat& src, const cv::Mat& 
         return false;
     }
 
-    // 手持连拍相邻帧刚体位移合理性校验 (SPEC_02 §2.2.5 行间距周期性假锁定物理熔断: tx <= 15px, ty <= 10px)
-    if (std::abs(H.at<double>(0, 2)) > 15.0 || std::abs(H.at<double>(1, 2)) > 10.0) {
-        LOGW("alignFrameHomography: excessive translation tx=%.2f, ty=%.2f -> rejected (line-pitch false lock guard)",
-             H.at<double>(0, 2), H.at<double>(1, 2));
+    // [SPEC_02 §2.4.2 v23] 位移场合理性 (中心+四角) + 半分辨率高通 ZNCC 结构校验，取代固定 tx/ty 像素熔断
+    if (!displacementWithinLimit(H, ref.rows, ref.cols, "alignFrameHomography")) {
+        return false;
+    }
+    if (!verifyAlignment(src, ref, H, "ORB-Homography")) {
         return false;
     }
 
@@ -157,20 +282,21 @@ bool BurstFusionEngine::alignFrameECC(const cv::Mat& src, const cv::Mat& ref, cv
         LOGI("alignFrameECC: cc=%.4f, rot=%.3f deg, s=%.4f, tx=%.2f, ty=%.2f, dist=%.2f",
              cc, theta * 180.0 / CV_PI, s, tx, ty, transDist);
 
-        // 严格物理自检 (SPEC_02 §2.2.5 行间距周期性假锁定物理熔断):
-        // 手持 40ms 连拍物理位移上限: 全尺度 transDist <= 8.0px, |ty| <= 6.5px, 旋转 < 3度, 相关度 >= 0.60
-        if (cc >= 0.60 && std::abs(theta) < 0.052 && transDist <= 8.0 && std::abs(ty) <= 6.5) {
-            outH = (cv::Mat_<double>(3, 3) <<
+        // [SPEC_02 §2.4.2 v23] 位移场 (中心+四角) 合理性 + 旋转 ≤ 5° + cc ≥ 0.60；
+        // 注意: findTransformECC 返回的 W 满足 src(W·x) ≈ ref(x)，即 ref→src，必须取逆作为 src→ref 的 outH！
+        if (cc >= 0.60 && std::abs(theta) < 0.087) {
+            cv::Mat H_ref2src = (cv::Mat_<double>(3, 3) <<
                 a00, a01, tx,
                 a10, a11, ty,
                 0.0, 0.0, 1.0);
-            cv::warpPerspective(src, outWarped, outH, ref.size(),
-                                cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-            return true;
-        }
-        if (transDist > 8.0 || std::abs(ty) > 6.5) {
-            LOGW("alignFrameECC: rejected due to physical motion breach / periodic line-pitch jump: tx=%.2f, ty=%.2f, dist=%.2f",
-                 tx, ty, transDist);
+            cv::Mat H_src2ref = H_ref2src.inv();
+            if (displacementWithinLimit(H_src2ref, ref.rows, ref.cols, "alignFrameECC") &&
+                verifyAlignment(src, ref, H_src2ref, "ECC")) {
+                outH = H_src2ref;
+                cv::warpPerspective(src, outWarped, outH, ref.size(),
+                                    cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+                return true;
+            }
         }
         return false;
     } catch (const std::exception& e) {
@@ -203,16 +329,15 @@ bool BurstFusionEngine::alignFrameMTB(const cv::Mat& src, const cv::Mat& ref, cv
         cv::Point shift = aligner->calculateShift(grayRef, graySrc);
         LOGI("alignFrameMTB: computed robust exposure shift dx=%d, dy=%d", shift.x, shift.y);
 
-        // 严格物理限制: 连拍帧间物理位移不超过 8 像素
-        if (std::abs(shift.x) > 8 || std::abs(shift.y) > 8) {
-            LOGW("alignFrameMTB: excessive shift dx=%d, dy=%d -> rejected", shift.x, shift.y);
-            return false;
-        }
-
         outH = (cv::Mat_<double>(3, 3) <<
             1.0, 0.0, static_cast<double>(shift.x),
             0.0, 1.0, static_cast<double>(shift.y),
             0.0, 0.0, 1.0);
+        // [SPEC_02 §2.4.2 v23] 位移场合理性 + 结构校验 (取代固定 8px 上限)
+        if (!displacementWithinLimit(outH, ref.rows, ref.cols, "alignFrameMTB") ||
+            !verifyAlignment(src, ref, outH, "MTB")) {
+            return false;
+        }
         cv::warpPerspective(src, outWarped, outH, ref.size(),
                             cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         return true;
@@ -280,18 +405,19 @@ bool BurstFusionEngine::alignGradientPhaseCorrelation(const cv::Mat& src, const 
 
     LOGI("alignGradientPhaseCorrelation: response=%.4f, dx=%.2f, dy=%.2f", response, dx, dy);
 
-    // 严格物理限制: 连拍帧间物理位移不超过 6 像素, 响应度 >= 0.20
-    if (response >= 0.20 && std::hypot(dx, dy) <= 6.0 && std::abs(dy) <= 5.0) {
-        outH = (cv::Mat_<double>(3, 3) <<
+    // [SPEC_02 §2.4.2 v23] 响应度 >= 0.20 + 位移场合理性 + 结构校验 (取代固定 6px 上限)
+    if (response >= 0.20) {
+        cv::Mat Hpc = (cv::Mat_<double>(3, 3) <<
             1.0, 0.0, dx,
             0.0, 1.0, dy,
             0.0, 0.0, 1.0);
-        cv::warpPerspective(src, outWarped, outH, ref.size(),
-                            cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-        return true;
-    }
-    if (std::hypot(dx, dy) > 6.0) {
-        LOGW("alignGradientPhaseCorrelation: excessive shift dx=%.2f, dy=%.2f -> rejected", dx, dy);
+        if (displacementWithinLimit(Hpc, ref.rows, ref.cols, "alignGradientPhaseCorrelation") &&
+            verifyAlignment(src, ref, Hpc, "PhaseCorr")) {
+            outH = Hpc;
+            cv::warpPerspective(src, outWarped, outH, ref.size(),
+                                cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+            return true;
+        }
     }
 
     return false;
@@ -494,12 +620,14 @@ bool BurstFusionEngine::alignHighlightTemplate(const cv::Mat& srcShort, const cv
 
             double fullTx = tx * invScale;
             double fullTy = ty * invScale;
-            // 物理自检: 手持连续曝光 burst 旋转角 < 3度, 缩放 0.96~1.04, 全图平移 <= 10.0px
-            if (s >= 0.96 && s <= 1.04 && std::abs(theta) < 0.052 && std::hypot(fullTx, fullTy) <= 10.0) {
-                outH = (cv::Mat_<double>(3, 3) <<
-                    a00, a01, fullTx,
-                    a10, a11, fullTy,
-                    0.0, 0.0, 1.0);
+            // [SPEC_02 §2.4.2 v23] 物理自检: 旋转 ≤ 5°, 缩放 0.96~1.04, 位移场 (中心+四角) 在限幅内
+            cv::Mat H_try = (cv::Mat_<double>(3, 3) <<
+                a00, a01, fullTx,
+                a10, a11, fullTy,
+                0.0, 0.0, 1.0);
+            if (s >= 0.96 && s <= 1.04 && std::abs(theta) < 0.087 &&
+                displacementWithinLimit(H_try, refBase.rows, refBase.cols, "alignHighlightTemplate")) {
+                outH = H_try;
                 fitSuccess = true;
                 LOGI("alignHighlightTemplate: fitted Multi-Peak Rigid Affine: s=%.4f, rot=%.3f deg, tx=%.2f, ty=%.2f",
                      s, theta * 180.0 / CV_PI, fullTx, fullTy);
@@ -525,7 +653,7 @@ bool BurstFusionEngine::alignHighlightTemplate(const cv::Mat& srcShort, const cv
         LOGI("alignHighlightTemplate: single/best-peak translation: dx=%.2f, dy=%.2f, score=%.4f",
              fullDx, fullDy, bestScore);
 
-        if (bestScore >= 0.65 && std::hypot(fullDx, fullDy) <= 10.0) {
+        if (bestScore >= 0.65 && std::hypot(fullDx, fullDy) <= 0.08 * std::max(refBase.rows, refBase.cols)) {
             outH = (cv::Mat_<double>(3, 3) <<
                 1.0, 0.0, fullDx,
                 0.0, 1.0, fullDy,
@@ -736,8 +864,11 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
 
         // [SPEC_02 §2.3 / SPEC_REF] 基准帧绝对主导保边融合: 计算 Frame 0 边缘梯度掩模 M_edge
         cv::Mat mEdgeMat(superRows, superCols, CV_32FC1);
-        const float tau_noise_base = 10.0f;
-        const float sigma_trans_base = 20.0f;
+        // [SPEC_02 §2.4.2 v23] 噪声自适应掩模: 由基准帧估计 σ_n，τ = max(10, 2.2σ_n)，过渡带 = max(20, 1.5σ_n)
+        const float sigmaNoise = estimateLumaNoiseSigma(tier1[0]);
+        const float tau_noise_base = std::max(10.0f, 2.2f * sigmaNoise);
+        const float sigma_trans_base = std::max(20.0f, 1.5f * sigmaNoise);
+        LOGI("Tier 1 base noise sigma=%.2f -> edge mask tau=%.1f, trans=%.1f", sigmaNoise, tau_noise_base, sigma_trans_base);
 
         #pragma omp parallel for schedule(static)
         for (int y = 0; y < superRows; ++y) {
@@ -772,10 +903,11 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
 
         for (size_t k = 1; k < tier1.size(); ++k) {
             cv::Mat warped1x, H;
-            // Tier 1 相同曝光：优先 CLAHE ORB，若微抖动失配则尝试 ECC，再回退对数梯度相位相关
-            bool alignedT1 = alignFrameHomography(tier1[k], tier1[0], warped1x, H);
+            // [SPEC_02 §2.4 v23] Tier 1 相同曝光：ECC 优先 (光度不变、亚像素精度，已修正 ref→src 方向)，
+            // 其次 CLAHE ORB，最后对数梯度相位相关。每个候选均经位移场限幅 + 高通 ZNCC 结构校验。
+            bool alignedT1 = alignFrameECC(tier1[k], tier1[0], warped1x, H);
             if (!alignedT1) {
-                alignedT1 = alignFrameECC(tier1[k], tier1[0], warped1x, H);
+                alignedT1 = alignFrameHomography(tier1[k], tier1[0], warped1x, H);
             }
             if (!alignedT1) {
                 alignedT1 = alignGradientPhaseCorrelation(tier1[k], tier1[0], warped1x, H);
@@ -784,37 +916,58 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 LOGW("Tier 1 Frame %zu alignment failed -> SKIPPED from super-res accumulation", k);
                 continue;
             }
-            double tDist = std::hypot(H.at<double>(0, 2), H.at<double>(1, 2));
-            if (tDist > 4.0) {
-                LOGW("Tier 1 Frame %zu excessive displacement tDist=%.2f -> SKIPPED from super-res accumulation", k, tDist);
-                continue;
-            }
+            LOGI("Tier 1 Frame %zu aligned: max displacement field=%.1fpx", k, maxDisplacement(H, rows, cols));
 
-            // [SPEC_02 §2.3.1 / MotoCam Parity] Edge-MAD 结构对齐校验 (bDropGhost 周期性假锁定熔断)
+            // [SPEC_02 §2.4.2 / MotoCam Parity] Edge-MAD 结构对齐校验 (bDropGhost) —— 噪声自适应：
+            // 1. 全采样点帧间绝对差的中位数估计平坦区噪声 m_flat = 1.183 * median
+            // 2. 边缘判据 grad > max(20, 4.5σ_n)，丢弃门限 max(18, 1.7·m_flat + 4)
+            const int edgeGradThr = static_cast<int>(std::max(20.0f, 4.5f * sigmaNoise));
             float edgeDiffSum = 0.0f;
             int edgeCount = 0;
+            std::vector<uchar> allDiffs;
+            allDiffs.reserve((rows / 4 + 1) * (cols / 4 + 1));
             for (int y = 0; y < rows; y += 4) {
                 const cv::Vec3b* pB0 = tier1[0].ptr<cv::Vec3b>(y);
                 const cv::Vec3b* pBWarp = warped1x.ptr<cv::Vec3b>(y);
                 const cv::Vec3b* pBDown = (y + 4 < rows) ? tier1[0].ptr<cv::Vec3b>(y + 4) : pB0;
                 for (int x = 0; x < cols; x += 4) {
+                    if (pBWarp[x][0] == 0 && pBWarp[x][1] == 0 && pBWarp[x][2] == 0) continue;  // 配准后的无效边界
                     int xNext = (x + 4 < cols) ? x + 4 : x;
                     int y0 = (29 * pB0[x][0] + 150 * pB0[x][1] + 77 * pB0[x][2]) >> 8;
                     int yR = (29 * pB0[xNext][0] + 150 * pB0[xNext][1] + 77 * pB0[xNext][2]) >> 8;
                     int yD = (29 * pBDown[x][0] + 150 * pBDown[x][1] + 77 * pBDown[x][2]) >> 8;
                     int grad = std::abs(yR - y0) + std::abs(yD - y0);
-                    if (grad > 20) {
-                        int yWarp = (29 * pBWarp[x][0] + 150 * pBWarp[x][1] + 77 * pBWarp[x][2]) >> 8;
-                        edgeDiffSum += std::abs(y0 - yWarp);
+                    int yWarp = (29 * pBWarp[x][0] + 150 * pBWarp[x][1] + 77 * pBWarp[x][2]) >> 8;
+                    int d = std::abs(y0 - yWarp);
+                    allDiffs.push_back(static_cast<uchar>(std::min(d, 255)));
+                    if (grad > edgeGradThr) {
+                        edgeDiffSum += static_cast<float>(d);
                         edgeCount++;
                     }
                 }
             }
+            float madFlat = 0.0f;
+            if (allDiffs.size() > 100) {
+                size_t mid = allDiffs.size() / 2;
+                std::nth_element(allDiffs.begin(), allDiffs.begin() + mid, allDiffs.end());
+                madFlat = 1.183f * static_cast<float>(allDiffs[mid]);
+            }
             float madEdge = (edgeCount > 100) ? (edgeDiffSum / static_cast<float>(edgeCount)) : 0.0f;
-            LOGI("Tier 1 Frame %zu Edge-MAD check: edgeCount=%d, MAD_edge=%.2f", k, edgeCount, madEdge);
-            if (madEdge > 18.0f) {
-                LOGW("Tier 1 Frame %zu periodic line-pitch or ghost detected (MAD=%.2f > 18.0) -> DROPPED (De-motion Guard)", k, madEdge);
+            const float dropThr = std::max(18.0f, 1.7f * madFlat + 4.0f);
+            LOGI("Tier 1 Frame %zu Edge-MAD check: edgeCount=%d, MAD_edge=%.2f, MAD_flat=%.2f, dropThr=%.2f",
+                 k, edgeCount, madEdge, madFlat, dropThr);
+            if (madEdge > dropThr) {
+                LOGW("Tier 1 Frame %zu structural mismatch (MAD_edge=%.2f > %.2f) -> DROPPED (De-motion Guard)", k, madEdge, dropThr);
                 continue;
+            }
+
+            // 噪声自适应光度截止与时域高斯核
+            const int idiffCut = static_cast<int>(std::clamp(3.5f * madFlat, 16.0f, 90.0f));
+            const float sigmaT = std::max(18.0f, 1.6f * madFlat);
+            float localLUT[256];
+            for (int i = 0; i < 256; ++i) {
+                float d = static_cast<float>(i);
+                localLUT[i] = std::exp(-(d * d) / (2.0f * sigmaT * sigmaT));
             }
 
             cv::Mat H2x = S2 * H;
@@ -842,10 +995,10 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                     int yk = (29 * bk[0] + 150 * bk[1] + 77 * bk[2]) >> 8;
 
                     int idiff = std::abs(y0 - yk);
-                    // [MotoCam Parity: 硬光度噪声截止] 散粒噪声最大差值不超过 16，超出 16 必为位移残差或伪影，强制剔除！
-                    if (idiff > 16) continue;
+                    // [SPEC_02 §2.4.2 v23: 噪声自适应光度截止] max(16, 3.5·m_flat)，高 ISO 下不再误杀纯噪声差异
+                    if (idiff > idiffCut) continue;
 
-                    float w = (1.0f - mEdge) * expLUT[idiff];
+                    float w = (1.0f - mEdge) * localLUT[idiff];
                     if (w > 0.04f) {
                         pAccum[x][0] += w * static_cast<float>(bk[0]);
                         pAccum[x][1] += w * static_cast<float>(bk[1]);
@@ -1187,8 +1340,24 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         cv::Sobel(Y_float, grad_y, CV_32F, 0, 1, 3);
         cv::magnitude(grad_x, grad_y, grad_mag);
 
-        const float tau_noise   = 10.0f;
-        const float sigma_trans = 20.0f;
+        // [SPEC_02 §2.4.3 v23] 噪声自适应: σ_sobel = median(|Gx|)/0.6745，τ = max(10, 2.5σ_sobel)，过渡带 = max(20, 2σ_sobel)
+        float sigmaSobel = 0.0f;
+        {
+            std::vector<float> gxSamples;
+            gxSamples.reserve((superRows / 8 + 1) * (superCols / 8 + 1));
+            for (int y = 0; y < superRows; y += 8) {
+                const float* pg = grad_x.ptr<float>(y);
+                for (int x = 0; x < superCols; x += 8) gxSamples.push_back(std::abs(pg[x]));
+            }
+            if (gxSamples.size() > 100) {
+                size_t mid = gxSamples.size() / 2;
+                std::nth_element(gxSamples.begin(), gxSamples.begin() + mid, gxSamples.end());
+                sigmaSobel = gxSamples[mid] / 0.6745f;
+            }
+        }
+        const float tau_noise   = std::max(10.0f, 2.5f * sigmaSobel);
+        const float sigma_trans = std::max(20.0f, 2.0f * sigmaSobel);
+        LOGI("Step6 ISP: sobel noise sigma=%.2f -> tau=%.1f, trans=%.1f", sigmaSobel, tau_noise, sigma_trans);
         cv::Mat M_edge = (grad_mag - tau_noise) / sigma_trans;
         cv::threshold(M_edge, M_edge, 0.0f, 0.0f, cv::THRESH_TOZERO);   // clamp 下界
         cv::min(M_edge, 1.0f, M_edge);                                   // clamp 上界
@@ -1197,7 +1366,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
         cv::Mat Y_smooth_float;
         cv::bilateralFilter(Y_float, Y_smooth_float, 7, 35.0, 7.0);
 
-        // 6. 锐化与微反差分支: 50MP Acutance Synthesis (amount=0.75, σ=1.8 + adaptive micro-contrast)
+        // 6. 锐化与微反差分支: 50MP Acutance Synthesis (amount=0.75, σ=1.8 + 有界微反差)
         cv::Mat Y_gauss;
         cv::GaussianBlur(Y_float, Y_gauss, cv::Size(0, 0), 1.8);
         cv::Mat Y_diff = Y_float - Y_gauss;
@@ -1212,10 +1381,23 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 float absD = std::abs(d);
                 if (absD > 3.0f) {
                     float sign = (d > 0.0f) ? 1.0f : -1.0f;
-                    float boost = std::min(absD * 0.6f, 25.0f);
+                    float boost = std::min(absD * 0.35f, 12.0f);
                     pSharp[x] += sign * boost;
                 }
             }
+        }
+
+        // 6b. 过冲限幅 (anti-halo): 锐化结果不得超出原亮度 5×5 邻域的 [min, max]，
+        //     消除“边缘一圈亮边 + 笔画内部偏暗”的中空字形
+        {
+            cv::Mat Y_max8, Y_min8, Y_maxF, Y_minF;
+            cv::Mat k5 = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+            cv::dilate(Y_ch, Y_max8, k5);
+            cv::erode(Y_ch, Y_min8, k5);
+            Y_max8.convertTo(Y_maxF, CV_32F);
+            Y_min8.convertTo(Y_minF, CV_32F);
+            cv::min(Y_sharp_float, Y_maxF, Y_sharp_float);
+            cv::max(Y_sharp_float, Y_minF, Y_sharp_float);
         }
 
         // 7. 按掩模 alpha 混合: Y_final = (1-M)·Y_smooth + M·Y_sharp

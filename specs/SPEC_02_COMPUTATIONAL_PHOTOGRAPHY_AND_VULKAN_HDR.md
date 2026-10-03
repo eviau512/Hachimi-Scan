@@ -182,6 +182,36 @@ For candidate frames that pass the global edge verification:
    Within consecutive EV 0 burst frames (40ms interval with OIS), enforce:
    $$\|\mathbf{t}\| \le 4.0\,\text{pixels}$$
 
+> [!WARNING]
+> **v23 SUPERSEDES** the fixed pixel caps of §2.2.5 (ECC $\le 8$ px, Homography $|t_x|\le 15$, $|t_y| \le 10$, MTB $\le 8$, PhaseCorr $\le 6$, Template $\le 10$) and the 4.0 px bound / hard cutoff 16 of §2.3.2 above. See §2.4. Those numbers were derived from a mis-diagnosed incident and break real handheld bursts.
+
+### 2.4 [v23 REQUIRED] Verified Alignment, Correct Warp Convention & Noise-Adaptive Gating (校验式对齐与噪声自适应门限)
+
+#### 2.4.1 Forensics (log `hachicam_log_20261003_180911`, ISO 17408, 58 ms, 7 frames)
+- Every alignment path was rejected by fixed caps although ECC reported $cc = 0.9998$: Tier 1 frames 1–3 SKIPPED, Tier 2/3 plates ISOLATED, HDR bypassed. Result: a single, extremely noisy 58 ms frame (lamp clipped to a ball, noise exploded).
+- **Cap root cause**: ECC `MOTION_EUCLIDEAN` returns $(t_x, t_y)$ for rotation about the **image origin**. A $1^\circ$ roll gives $t \approx (36, -33)$ px while the displacement at the image centre is only $\approx (32, -27)$ px of *genuine* hand shake; real burst shake at 12 MP is $10 \sim 100$ px. Caps of $6 \sim 15$ px are physically wrong for 58 ms frames.
+- **ECC convention bug (since v18)**: `cv::findTransformECC(template=ref, input=src)` returns $W$ with $\text{src}(W\mathbf{x}) \approx \text{ref}(\mathbf{x})$, i.e. $W$ maps **ref → src**. The engine used $W$ directly as the src → ref matrix, so every ECC-accepted frame was warped by **twice the displacement in the wrong direction** (verified numerically: mean abs error 33.8 with $W$, 0.70 with $W^{-1}$). This was the true source of earlier "line-pitch" double text, not periodic false locks.
+
+#### 2.4.2 Rules
+1. **ECC**: output matrix $H_{src \to ref} = W^{-1}$ (3×3 inverse, translation rescaled to full resolution).
+2. **Motion sanity** is measured on the displacement field, never on raw matrix translation: $d(\mathbf{p}) = \lVert H\mathbf{p} - \mathbf{p} \rVert$ evaluated at the centre and four corners. Reject only if $\max d > 0.08 \cdot \max(\text{rows}, \text{cols})$, or $|\theta| > 5^\circ$, or scale $\notin [0.94, 1.06]$.
+3. **Structural verification (replaces caps)**: every accepted transform is scored by the zero-mean normalised cross-correlation (ZNCC) of **high-pass luma** ($G_{1.2} - G_{5.0}$, half resolution, clipped pixels $<4$ or $>250$ and warp borders excluded) between the warped source and the reference:
+   - same-exposure pairs (mean-luma ratio within $[0.7, 1.4]$): require $\text{ZNCC}(H) \ge 0.03$ (noise-only correlation is $\approx 0$), $\text{ZNCC}(H) \ge \text{ZNCC}(I) - 0.01$, and, if the transform moves any probe point by more than 2 px, $\text{ZNCC}(H) \ge \text{ZNCC}(I) + 0.02$ (alignment must strictly beat not aligning);
+   - cross-exposure pairs: rely on the aligner's own confidence (ECC $cc \ge 0.60$, template score $\ge 0.65$, MTB, ORB inlier tests); the score is only logged.
+   - The score is always logged (`verify[...]: hp-zncc=… identity=… moved=…`) for calibration.
+   - Tier 1 solver order: ECC → ORB homography → gradient phase correlation (ECC is photometrically invariant and sub-pixel exact).
+4. **Noise-adaptive Tier 1 gating** (supersedes the fixed 18 / 16 constants). Estimate flat-region noise $m_{flat}$ = mean $|Y_0 - Y_k^{warped}|$ over non-edge samples:
+   - Edge-MAD drop threshold: $\max(18,\; 1.7\,m_{flat} + 4)$.
+   - Photometric cutoff: $\max(16,\; 3.5\,m_{flat})$ (capped at 90); temporal Gaussian $\sigma_t = \max(18,\; 1.6\,m_{flat})$.
+5. **Noise-adaptive edge mask** for AddBackEdge: estimate $\sigma_n$ from the base frame (median of $|\Delta Y|$ over a grid, $\sigma_n = \text{median}/0.954$); $\tau = \max(10,\; 2.2\sigma_n)$, transition $= \max(20,\; 1.5\sigma_n)$. A mask calibrated at ISO 800 marks noise as edge at ISO 17408 and disables all temporal denoising.
+
+#### 2.4.3 Step 6 ISP: Noise-Adaptive Mask & Anti-Halo (hollow-glyph root cause)
+- A fixed $\tau = 10$ on the Sobel response flags noise as edge at high ISO → unsharp + clarity boost on noise ("noise explosion"). Use $\tau = \max(10,\; 2.5\,\sigma_{sobel})$ with $\sigma_{sobel}=\text{median}(|G_x|)/0.6745$, transition $\max(20, 2\sigma_{sobel})$.
+- Rim-only boosting (edge band sharpened, stroke interior bilaterally smoothed) yields **hollow outline glyphs**. Required: the sharpened luma is **clamped to the local $5{\times}5$ min/max of the pre-sharpen luma** (overshoot limiter), and the non-linear clarity boost is bounded to $\min(0.35|d|, 12)$.
+
+#### 2.4.4 Known optical artifact (not a fusion bug)
+A small displaced ring/crescent mirrored about the optical centre of a strong lamp is lens flare present in the source frames; short-exposure plates reduce it only once aligned. No synthetic removal is specified.
+
 ---
 
 
