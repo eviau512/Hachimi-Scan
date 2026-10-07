@@ -214,7 +214,67 @@ A small displaced ring/crescent mirrored about the optical centre of a strong la
 
 ---
 
+### 2.5 [v24 REQUIRED] Hierarchical (Global + Local) Alignment, Tile-Level Gating, Luma-Only Highlight Graft (分层对齐与分块门控、仅亮度高光嫁接)
 
+> Status: **specified, not yet implemented.** Written after comparing HachiCam v0.1.2-rc0 (Ace3V) with MotoCam (G75) on a tablet home screen, a PowerShell window, an Excel sheet and a dark room with lamps. Overall quality improved over v22; two defects remain (A, B). The numbers below come from the one fusion run retained in `hachicam_log_20261007_214022.txt` plus visual comparison; they are evidence, not proof of a single cause.
+
+#### 2.5.1 Defect A — soft text / high-frequency detail in part of the frame
+
+**Forensics (Tier 1, 7-frame run, ISO 17984, 58.3 ms)** — ECC now accepts all three candidate frames, but residual grows with hand displacement:
+
+| Frame | moved (px) | hp-ZNCC (aligned) | Edge-MAD$_{edge}$ |
+|:--:|:--:|:--:|:--:|
+| 1 | 9.4 | 0.957 | 9.46 |
+| 2 | 37.8 | 0.888 | 13.18 |
+| 3 | 81.3 | 0.776 | 16.25 (drop limit 18.0; MAD$_{flat}$ = 2.37) |
+
+Interpretation: a single global rigid transform (ECC `MOTION_EUCLIDEAN`, 3 DOF) cannot describe handheld shake of a *planar screen seen at an angle* (pitch/yaw ⇒ keystone/perspective change), rolling-shutter shear and slight depth variation. The fit is good near the point ECC converges on and degrades elsewhere, and frames with larger shake pass the global gate while being mis-registered by 1–3 px in some tiles. Averaging such frames softens exactly the tiles where residual is largest ⇒ "some regions sharp, some regions blurry". The Edge-MAD gate is global (one value per frame), so it cannot reject a frame *locally*.
+
+Other contributors that the implementation must **measure rather than assume** (see 2.5.6): (i) genuine defocus when the screen plane is tilted relative to the sensor (depth of field) — fusion cannot recover this; the lower region of the PowerShell sample looks like defocus, not misalignment; (ii) JPEG-domain input already hardware-denoised.
+
+**Rules**
+1. **Three-stage alignment** for every Tier 1 frame $k$ against the reference (replaces "single transform per frame"):
+   1. *Global seed*: ORB (CLAHE) homography **and** ECC with `MOTION_HOMOGRAPHY` (8 DOF, 1/4 resolution, initialised from the ORB/Euclid result). Euclid ECC remains only as a fallback. Keep the §2.4.2 displacement-field sanity limits but allow perspective terms (bounded so that the corner displacement limit holds).
+   2. *Local refinement*: dense flow on the globally-warped source. Preferred: OpenCV DIS optical flow (`PRESET_MEDIUM`, 1/2 resolution, luma high-pass-weighted) → upsampled flow field $\mathbf{u}(\mathbf{p})$. Acceptable alternative: 64×64 tile block matching (±8 px search, sub-pixel by parabola fit, tile flows median-filtered, bilinear interpolated). Flow magnitude is clamped (e.g. ≤ 12 px at full-res) and smoothness-regularised so that flat/noisy regions follow neighbours rather than fitting noise.
+   3. *Warp* once, composing global $H$ and flow $\mathbf{u}$ (`remap`), never warping twice.
+2. **Tile-level motion gating** (replaces the per-frame-only drop): after warping, compute per 32×32 tile $t$ the weight
+   $w_k(t) = \exp\!\big(-\max(0,\, e_k(t) - e_{min})^2 / 2\sigma_e^2\big)\cdot c_k(t)$ with $e_k(t)$ = tile mean $|Y_0 - Y_k^{warp}|$ on edge pixels (noise-floor corrected using $m_{flat}$), $c_k(t)$ = tile high-pass ZNCC clamped to [0,1]. Tiles whose $w_k(t)<0.15$ use the reference frame only. Weights are bilinearly interpolated to pixels (no visible tile seams). The per-frame Edge-MAD drop of §2.4.2-4 remains as a coarse early-out only.
+3. **Reference-frame dominance (unchanged intent of §2.3)**: where the reference tile is sharp (high local gradient energy) the merge weight of other frames is capped (≤ 0.35 total) so that residual sub-pixel error cannot soften text; flat/noisy tiles may use full temporal averaging.
+4. **Reference selection**: instead of always frame 0, choose the reference among Tier 1 frames by local Laplacian-energy sum (sharpest frame, ties → earlier), because with 58 ms exposures one frame is often visibly shaken. All displacement/EXIF logic is expressed relative to the chosen reference.
+5. **Tier 2 / Tier 3 plates** use the same global+local pipeline *after* intensity normalisation (2.5.3).
+6. Cost target: ≤ ~1.5 s extra on Ace3V-class SoC at ≤ 12 MP-equivalent alignment resolution. Fusion runs in the background (SPEC_01 §7), so the time budget is relaxed, but memory must stay within SPEC_01 §7.4.
+
+#### 2.5.2 Noise estimation for already-denoised JPEG frames
+Log: $\sigma_n = 1.05$ and Sobel $\sigma = 2.97$ at ISO 17984; MAD$_{flat}$ between aligned frames was 2.37. The frames are ISP-denoised (spatially correlated blotches), so adjacent-pixel statistics under-estimate noise and the §2.4.2-5/§2.4.3 thresholds stayed at their floors.
+- Estimate $\sigma_n$ **temporally**: $\sigma_n \approx \text{MAD}_{flat}\,/\,(\sqrt{2}\cdot 0.6745)$ from aligned Tier 1 pairs on non-edge samples; use the $\max$ of spatial and temporal estimates in all thresholds of §2.4.2-5 and §2.4.3.
+- Log both estimates.
+
+#### 2.5.3 Cross-exposure alignment: exposure-invariant verification and best-candidate selection
+Log: Tier 3 (4 ms, mean-luma ratio 0.09) accepted an ORB homography that moved the plate by 208 px with hp-ZNCC 0.355 vs identity −0.015, while the ECC fallback scored 0.068 vs 0.075. §2.4.2-3 only *logs* the cross-exposure score; a wrong plate placement produces displaced highlight ghosts.
+1. Before scoring, gain-normalise the plate to the reference: $Y' = \text{clip}(Y_{plate}\cdot g)$ with $g$ = ratio of medians over pixels unclipped in both (or from EXIF exposure×ISO ratio when available); clipped/very dark pixels masked.
+2. Score cross-exposure candidates with a **Normalised Gradient Field** metric: mean over unmasked pixels of $|\cos\angle(\nabla Y_0, \nabla Y')|\cdot \min(|\nabla Y_0|,|\nabla Y'|)$, normalised by the same quantity at identity; plus the ZNCC of §2.4.2-3 on the gain-normalised image.
+3. **Pick the best-scoring candidate** among ORB / ECC / phase-correlation / template (not first-accepted); require score ≥ identity + margin, otherwise the plate is isolated (not used). Log every candidate's score.
+
+#### 2.5.4 Defect B — wrong colour in white UI regions (icon whites rendered grey/tinted)
+**Observation**: in P001/P002 the white areas of app icons (Telegram glyph, Lens, "64", Files) are rendered as a dull, slightly tinted, semi-transparent-looking fill with a bright thin rim, whereas MotoCam keeps them near-white. This is consistent with the highlight-graft path (§3.5): for base luma > ~200 the base is blended with Mertens-fused short-exposure plates; large flat near-white *UI* areas (not lamps) are pulled toward the darker plate and take its colour (per-frame AWB/exposure colour shifts, residual misalignment), while the edge/detail term still comes from the base ⇒ bright rim, grey interior. (Hypothesis from code reading and visual comparison; to be confirmed by the graft statistics in 2.5.6.)
+
+**Rules**
+1. **Graft in luma only.** Convert base and plates to YCrCb; modify only $Y$. Chroma ($C_r$, $C_b$) always comes from the base. Where base saturation is low (near-neutral, $|C_r-128|,|C_b-128| < 12$) chroma stays at the base value, never taken from a plate. The detail term $d = (1-\alpha)d_{base}+\alpha d_{short}$ is computed on $Y$ only.
+2. **Restrict the graft to genuinely lost highlights**: graft only where the base is clipped (e.g. $Y_{base} \ge 250$ in ≥ 2 channels) **and** the plate shows structure there (local gradient/variance above the noise floor) **and** the plate alignment was verified (2.5.3). A clipped region with *no* plate structure (flat white UI) keeps the base value.
+3. **Bounded pull-down**: $\Delta Y = Y_{base} - Y_{out} \le 18$ for connected regions larger than a lamp-size threshold (e.g. > 0.5 % of the frame) whose plate variance is flat; small, bright, structured regions (lamps/filaments) may take the full plate value.
+4. **Per-plate colour normalisation** before any use: per-channel gain matching of each plate to the base on the common mid-tone overlap (luma 60–200, unclipped), so a plate's white balance cannot tint the result.
+5. Regression check on the tablet icon sample: mean $(R,G,B)$ of icon-white interiors within ±6 of the base frame and channel spread $\max-\min \le 8$.
+
+#### 2.5.5 Unchanged
+Step 5 S-curve, Step 6 ISP safeguards of §2.4.3 and the lens-flare note of §2.4.4 remain in force.
+
+#### 2.5.6 Diagnostics required for v24 (so the next round can discriminate causes)
+- Per fusion run log: chosen reference index, per-frame global model, mean/95th-percentile local flow, **fraction of tiles with $w_k(t)<0.15$**, tile-weight summary, temporal σ estimate.
+- Debug-only (off by default): save a 16×12 tile map of mean $w_k$ and of reference Laplacian energy next to the log, so blur from misalignment (low $w$, high energy) can be told apart from defocus (low energy in all frames).
+- Log graft statistics: graft area fraction, mean ΔY, number of regions rejected by rules 2.5.4-2/3.
+- Keep fusion logs of the most recent N runs (not only the last), since the user's log contained only one run.
+
+---
 
 ## 3. OpenCV `createMergeMertens` Multi-Scale Fusion / 多尺度拉普拉斯融合
 
