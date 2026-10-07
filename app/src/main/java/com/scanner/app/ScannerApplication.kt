@@ -24,5 +24,16 @@ class ScannerApplication : Application() {
                 AppCompatDelegate.setApplicationLocales(LocaleListCompat.forLanguageTags(tag))
             }
         }
+
+        // Asynchronously clean up any leftover temporary burst files from earlier versions
+        Thread {
+            try {
+                cacheDir.listFiles()?.forEach { file ->
+                    if (file.name.startsWith("hdr_") || (file.name.endsWith(".jpg") && file.length() > 0 && !file.name.contains("thumb_"))) {
+                        file.delete()
+                    }
+                }
+            } catch (_: Exception) {}
+        }.start()
     }
 }
