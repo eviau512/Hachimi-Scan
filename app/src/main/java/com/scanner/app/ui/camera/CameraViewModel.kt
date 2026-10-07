@@ -12,6 +12,7 @@ import androidx.camera.core.CameraInfo
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -32,9 +33,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import com.scanner.app.domain.model.PageStatus
+import com.scanner.app.data.image.ImageStorage
 import org.opencv.core.Core
+import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.imgcodecs.Imgcodecs
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -68,6 +73,9 @@ class CameraViewModel : ViewModel() {
 
     private val _isCapturing = MutableStateFlow(false)
     val isCapturing: StateFlow<Boolean> = _isCapturing.asStateFlow()
+
+    private val _lastThumbnailBitmap = MutableStateFlow<Bitmap?>(null)
+    val lastThumbnailBitmap: StateFlow<Bitmap?> = _lastThumbnailBitmap.asStateFlow()
 
     val capturedPages: StateFlow<List<ScannedPage>> = PageRepository.pages
 
@@ -166,7 +174,8 @@ class CameraViewModel : ViewModel() {
 
     private fun captureSinglePhoto(context: Context, capture: ImageCapture, onPageSaved: (String) -> Unit) {
         _isCapturing.value = true
-        val photoFile = File(context.cacheDir, "${UUID.randomUUID()}.jpg")
+        val storage = ImageStorage(context)
+        val photoFile = File(storage.getStorageDir(), "${UUID.randomUUID()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
         val executor = ContextCompat.getMainExecutor(context)
 
@@ -185,9 +194,17 @@ class CameraViewModel : ViewModel() {
                             id = UUID.randomUUID().toString(),
                             originalImagePath = photoFile.absolutePath,
                             quad = finalQuad,
-                            filter = ImageFilter.MAGIC_COLOR
+                            filter = ImageFilter.MAGIC_COLOR,
+                            status = PageStatus.READY
                         )
                         PageRepository.addPage(newPage)
+                        try {
+                            val opts = BitmapFactory.Options().apply { inSampleSize = 8 }
+                            val bmp = BitmapFactory.decodeFile(photoFile.absolutePath, opts)
+                            if (bmp != null) _lastThumbnailBitmap.value = bmp
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
                         withContext(Dispatchers.Main) {
                             _isCapturing.value = false
                             onPageSaved(newPage.id)
@@ -204,18 +221,18 @@ class CameraViewModel : ViewModel() {
     }
 
     // ─────────────────────────────────────────────
-    // Apple Deep Fusion / Smart HDR 9-Frame Capture Pipeline
+    // Apple Deep Fusion / Smart HDR 7-Frame Capture Pipeline
     //
-    // Frame sequence (9 frames total):
+    // Frame sequence (7 frames total):
     //   Tier 1 (4 frames, EV 0):
     //     Frames 0, 1, 2, 3: AE locked, base exposure & sub-pixel super-res anchors
-    //   Tier 2 (3 frames, EV -2.5):
-    //     Frames 4, 5, 6: Manual midtone exposure transition
-    //   Tier 3 (2 frames, EV -5.0):
-    //     Frames 7, 8: Manual deep highlight recovery (lamp bulb/filament un-saturation)
+    //   Tier 2 (2 frames, EV -2.5):
+    //     Frames 4, 5: Manual midtone exposure transition
+    //   Tier 3 (1 frame, EV -6.0):
+    //     Frame 6: Manual deep highlight recovery (lamp bulb/filament un-saturation)
     //
     // All frames are fused by OpenCV MergeMertens multi-scale Laplacian pyramid
-    // + 50MP sub-pixel high-frequency detail transfer.
+    // + 50MP sub-pixel high-frequency detail transfer in the background.
     // Output: ~50MP JPEG @ quality 95, EXIF mode = "Full HDR"
     // ─────────────────────────────────────────────
 
@@ -231,37 +248,32 @@ class CameraViewModel : ViewModel() {
                     }
                 }
 
-                val tier1Files = mutableListOf<File>()
-                val tier2Files = mutableListOf<File>()
-                val tier3Files = mutableListOf<File>()
+                val tier1Bytes = mutableListOf<ByteArray>()
+                val tier2Bytes = mutableListOf<ByteArray>()
+                val tier3Bytes = mutableListOf<ByteArray>()
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 1: 4 帧正常曝光 (EV 0) — 50MP 亚像素超分与暗部降噪核心锚点
+                // Tier 1: 4 帧正常曝光 (EV 0) — 50MP 亚像素超分与暗部降噪核心锚点 (直接存入 RAM)
                 // ─────────────────────────────────────────────────────────────
-                coroutineScope {
-                    val t1Jobs = (0 until 4).map { i ->
-                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t1_$i.jpg")
-                        async {
-                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
-                        }
-                    }
-                    tier1Files.addAll(t1Jobs.awaitAll().filterNotNull())
+                for (i in 0 until 4) {
+                    val b = takeSinglePictureInMemory(capture, context)
+                    if (b != null) tier1Bytes.add(b)
                 }
 
-                if (tier1Files.isEmpty()) {
+                if (tier1Bytes.isEmpty()) {
                     _isCapturing.value = false
                     return@launch
                 }
 
-                // Inspect Frame 0 exposure parameters from EXIF
-                val file0 = tier1Files[0]
-                val baseIso: Int
-                val baseExpSec: Double
-                if (file0.exists()) {
-                    val ex0 = ExifInterface(file0.absolutePath)
+                // Inspect Frame 0 exposure parameters from in-memory EXIF
+                val bytes0 = tier1Bytes[0]
+                var baseIso: Int
+                var baseExpSec: Double
+                try {
+                    val ex0 = ByteArrayInputStream(bytes0).use { ExifInterface(it) }
                     baseIso = ex0.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, 800).coerceAtLeast(100)
                     baseExpSec = parseExposureTime(ex0.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)) ?: 0.033
-                } else {
+                } catch (e: Exception) {
                     baseIso = 800
                     baseExpSec = 0.033
                 }
@@ -288,16 +300,11 @@ class CameraViewModel : ViewModel() {
                 // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     setManualCaptureOptions(control, context, midExpNanos, midIso)
-                    delay(40) // Sensor register latch
+                    delay(25) // Sensor register latch
                 }
-                coroutineScope {
-                    val t2Jobs = (0 until 2).map { i ->
-                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t2_$i.jpg")
-                        async {
-                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
-                        }
-                    }
-                    tier2Files.addAll(t2Jobs.awaitAll().filterNotNull())
+                for (i in 0 until 2) {
+                    val b = takeSinglePictureInMemory(capture, context)
+                    if (b != null) tier2Bytes.add(b)
                 }
 
                 // ─────────────────────────────────────────────────────────────
@@ -305,91 +312,114 @@ class CameraViewModel : ViewModel() {
                 // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     setManualCaptureOptions(control, context, shortExpNanos, shortIso)
-                    delay(40) // Sensor register latch
+                    delay(25) // Sensor register latch
                 }
-                coroutineScope {
-                    val t3Jobs = (0 until 1).map { i ->
-                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t3_$i.jpg")
-                        async {
-                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
-                        }
-                    }
-                    tier3Files.addAll(t3Jobs.awaitAll().filterNotNull())
+                for (i in 0 until 1) {
+                    val b = takeSinglePictureInMemory(capture, context)
+                    if (b != null) tier3Bytes.add(b)
                 }
 
-                // Restore Auto-Exposure immediately after burst capture
+                // ─────────────────────────────────────────────────────────────
+                // 立即恢复自动曝光，拍摄阶段完毕，取景器立即恢复，转圈停止！
+                // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     clearManualCaptureOptions(control, context)
                 }
 
-                val allFiles = mutableListOf<File>().apply {
-                    addAll(tier1Files)
-                    addAll(tier2Files)
-                    addAll(tier3Files)
-                }
+                _isCapturing.value = false
+                frameAnalyzer?.resetStability()
 
-                allFiles.forEachIndexed { idx, f ->
-                    try {
-                        val ex = ExifInterface(f.absolutePath)
-                        val iso = ex.getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
-                        val exp = ex.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)
-                        android.util.Log.i("HachiCam-Burst", "Burst Frame $idx (total ${allFiles.size}): ISO=$iso, ExpTime=$exp, size=${f.length()} bytes")
-                    } catch (e: Exception) {
-                        android.util.Log.w("HachiCam-Burst", "Failed to inspect Frame $idx EXIF: ${e.message}")
-                    }
-                }
+                val storage = ImageStorage(context)
+                val pageId = UUID.randomUUID().toString()
+                val finalPhotoFile = File(storage.getStorageDir(), "${pageId}.jpg")
 
-                val finalPhotoFile = File(context.cacheDir, "${UUID.randomUUID()}.jpg")
-
-                withContext(Dispatchers.IO) {
-                    val deferredMats = allFiles.map { file ->
-                        async(Dispatchers.IO) {
-                            Imgcodecs.imread(file.absolutePath)
-                        }
-                    }
-                    val mats = deferredMats.awaitAll().filter { !it.empty() }
-
-                    if (mats.isNotEmpty()) {
-                        val fusionEngine = NativeBurstFusion()
-                        val fusedMat = fusionEngine.fuseBurstFrames(
-                            burstFrames = mats,
-                            removeGlare = true,
-                            isScreenMode = true,
-                            superResolution = true
-                        )
-                        if (!fusedMat.empty()) {
-                            rotateAndSaveFusedMat(fusedMat, allFiles[0], finalPhotoFile, mode = "Full HDR", jpegQuality = 95)
-                        } else {
-                            allFiles[0].copyTo(finalPhotoFile, overwrite = true)
-                            normalizeExifOrientation(finalPhotoFile)
-                            ExifUtils.stampSignature(finalPhotoFile, mode = "Full HDR")
-                        }
-                        for (m in mats) m.release()
-                    } else {
-                        allFiles[0].copyTo(finalPhotoFile, overwrite = true)
-                        normalizeExifOrientation(finalPhotoFile)
-                        ExifUtils.stampSignature(finalPhotoFile, mode = "Full HDR")
-                    }
-
-                    for (f in allFiles) f.delete()
-                }
-
-                val (photoW, photoH) = getImageDimensions(finalPhotoFile)
+                // 解码基础尺寸计算文档裁切 Quad
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes0, 0, bytes0.size, bounds)
+                val photoW = bounds.outWidth.toFloat()
+                val photoH = bounds.outHeight.toFloat()
                 val currentResult = _detectedQuad.value
                 val finalQuad = computeTargetQuad(currentResult, photoW, photoH)
 
                 val newPage = ScannedPage(
-                    id = UUID.randomUUID().toString(),
+                    id = pageId,
                     originalImagePath = finalPhotoFile.absolutePath,
                     quad = finalQuad,
-                    filter = ImageFilter.MAGIC_COLOR
+                    filter = ImageFilter.MAGIC_COLOR,
+                    status = PageStatus.PROCESSING
                 )
                 PageRepository.addPage(newPage)
 
-                withContext(Dispatchers.Main) {
-                    _isCapturing.value = false
-                    frameAnalyzer?.resetStability()
-                    onPageSaved(newPage.id)
+                // 快速生成基准帧缩略图，立即刷新右下角图库角标与页数
+                try {
+                    val thumbOpts = BitmapFactory.Options().apply { inSampleSize = 8 }
+                    val thumbBmp = BitmapFactory.decodeByteArray(bytes0, 0, bytes0.size, thumbOpts)
+                    if (thumbBmp != null) {
+                        _lastThumbnailBitmap.value = thumbBmp
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+
+                onPageSaved(newPage.id)
+
+                // ─────────────────────────────────────────────────────────────
+                // 后台并发执行 Native 对齐与 50MP Mertens 超分融合 (不阻塞主线程/取景)
+                // ─────────────────────────────────────────────────────────────
+                viewModelScope.launch(Dispatchers.Default) {
+                    try {
+                        val allBytes = mutableListOf<ByteArray>().apply {
+                            addAll(tier1Bytes)
+                            addAll(tier2Bytes)
+                            addAll(tier3Bytes)
+                        }
+                        val mats = allBytes.mapNotNull { b ->
+                            try {
+                                val bufMat = Mat(1, b.size, CvType.CV_8UC1)
+                                bufMat.put(0, 0, b)
+                                val m = Imgcodecs.imdecode(bufMat, Imgcodecs.IMREAD_COLOR)
+                                bufMat.release()
+                                if (m != null && !m.empty()) m else null
+                            } catch (e: Exception) {
+                                null
+                            }
+                        }
+
+                        if (mats.isNotEmpty()) {
+                            val fusionEngine = NativeBurstFusion()
+                            val fusedMat = fusionEngine.fuseBurstFrames(
+                                burstFrames = mats,
+                                removeGlare = true,
+                                isScreenMode = true,
+                                superResolution = true
+                            )
+                            if (!fusedMat.empty()) {
+                                rotateAndSaveFusedMatFromBytes(fusedMat, bytes0, finalPhotoFile, mode = "Full HDR", jpegQuality = 95)
+                                PageRepository.updatePage(newPage.copy(status = PageStatus.READY))
+                                try {
+                                    val opts = BitmapFactory.Options().apply { inSampleSize = 8 }
+                                    val fusedBmp = BitmapFactory.decodeFile(finalPhotoFile.absolutePath, opts)
+                                    if (fusedBmp != null) {
+                                        _lastThumbnailBitmap.value = fusedBmp
+                                    }
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            } else {
+                                saveFallbackFrame0(bytes0, finalPhotoFile)
+                                PageRepository.updatePage(newPage.copy(status = PageStatus.READY))
+                            }
+                            for (m in mats) m.release()
+                            fusedMat.release()
+                        } else {
+                            saveFallbackFrame0(bytes0, finalPhotoFile)
+                            PageRepository.updatePage(newPage.copy(status = PageStatus.READY))
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.e("HachiCam-Burst", "Background fusion failed: ${e.message}", e)
+                        saveFallbackFrame0(bytes0, finalPhotoFile)
+                        PageRepository.updatePage(newPage.copy(status = PageStatus.READY))
+                    }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -476,10 +506,48 @@ class CameraViewModel : ViewModel() {
     }
 
     /**
-     * Read EXIF orientation from [refFile], rotate [fusedMat] using OpenCV SIMD rotate,
-     * write JPEG at [jpegQuality]%, then stamp EXIF provenance from [refFile].
-     * This avoids the expensive Java Bitmap decode/re-encode path for rotation.
+     * Read EXIF orientation from [refBytes], rotate [fusedMat] using OpenCV SIMD rotate,
+     * write JPEG at [jpegQuality]%, then stamp EXIF provenance from [refBytes].
+     * This avoids writing temporary files to disk.
      */
+    private fun rotateAndSaveFusedMatFromBytes(
+        fusedMat: Mat,
+        refBytes: ByteArray,
+        outFile: File,
+        mode: String,
+        jpegQuality: Int = 95
+    ) {
+        val orientation = try {
+            ByteArrayInputStream(refBytes).use { stream ->
+                ExifInterface(stream).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            }
+        } catch (e: Exception) {
+            ExifInterface.ORIENTATION_NORMAL
+        }
+
+        val uprightMat = when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> {
+                val r = Mat(); Core.rotate(fusedMat, r, Core.ROTATE_90_CLOCKWISE); fusedMat.release(); r
+            }
+            ExifInterface.ORIENTATION_ROTATE_180 -> {
+                val r = Mat(); Core.rotate(fusedMat, r, Core.ROTATE_180); fusedMat.release(); r
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 -> {
+                val r = Mat(); Core.rotate(fusedMat, r, Core.ROTATE_90_COUNTERCLOCKWISE); fusedMat.release(); r
+            }
+            else -> fusedMat
+        }
+
+        val saveParams = org.opencv.core.MatOfInt(org.opencv.imgcodecs.Imgcodecs.IMWRITE_JPEG_QUALITY, jpegQuality)
+        Imgcodecs.imwrite(outFile.absolutePath, uprightMat, saveParams)
+        saveParams.release()
+        uprightMat.release()
+        ExifUtils.copyAndStampExif(refBytes, outFile, mode = mode)
+    }
+
     private fun rotateAndSaveFusedMat(
         fusedMat: Mat,
         refFile: File,
@@ -514,6 +582,79 @@ class CameraViewModel : ViewModel() {
         saveParams.release()
         uprightMat.release()
         ExifUtils.copyAndStampExif(refFile, outFile, mode = mode)
+    }
+
+    private fun saveFallbackFrame0(bytes: ByteArray, outFile: File) {
+        try {
+            val orientation = try {
+                ByteArrayInputStream(bytes).use { stream ->
+                    ExifInterface(stream).getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION,
+                        ExifInterface.ORIENTATION_NORMAL
+                    )
+                }
+            } catch (e: Exception) {
+                ExifInterface.ORIENTATION_NORMAL
+            }
+
+            val rotationDegrees = when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                else -> 0
+            }
+
+            if (rotationDegrees != 0) {
+                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                if (bmp != null) {
+                    val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                    val rotatedBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                    FileOutputStream(outFile).use { out ->
+                        rotatedBmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                    }
+                    if (rotatedBmp != bmp) bmp.recycle()
+                    rotatedBmp.recycle()
+                } else {
+                    FileOutputStream(outFile).use { it.write(bytes) }
+                }
+            } else {
+                FileOutputStream(outFile).use { it.write(bytes) }
+            }
+            ExifUtils.copyAndStampExif(bytes, outFile, mode = "Fallback Frame 0")
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private suspend fun takeSinglePictureInMemory(
+        capture: ImageCapture,
+        context: Context
+    ): ByteArray? = suspendCancellableCoroutine { continuation ->
+        val executor = ContextCompat.getMainExecutor(context)
+        capture.takePicture(
+            executor,
+            object : ImageCapture.OnImageCapturedCallback() {
+                override fun onCaptureSuccess(image: ImageProxy) {
+                    try {
+                        val plane = image.planes[0]
+                        val buffer = plane.buffer
+                        val bytes = ByteArray(buffer.remaining())
+                        buffer.get(bytes)
+                        if (continuation.isActive) continuation.resume(bytes)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        if (continuation.isActive) continuation.resume(null)
+                    } finally {
+                        image.close()
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    exception.printStackTrace()
+                    if (continuation.isActive) continuation.resume(null)
+                }
+            }
+        )
     }
 
     private suspend fun takeSinglePicture(
@@ -613,7 +754,9 @@ class CameraViewModel : ViewModel() {
     fun importFromUri(context: Context, uri: Uri, onPageSaved: (String) -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val photoFile = File(context.cacheDir, "${java.util.UUID.randomUUID()}.jpg")
+                val storage = ImageStorage(context)
+                val pageId = UUID.randomUUID().toString()
+                val photoFile = File(storage.getStorageDir(), "$pageId.jpg")
                 context.contentResolver.openInputStream(uri)?.use { input ->
                     photoFile.outputStream().use { output -> input.copyTo(output) }
                 }
@@ -630,7 +773,12 @@ class CameraViewModel : ViewModel() {
                         computeTargetQuad(null, photoW, photoH)
                     }
 
-                    val page = ScannedPage(originalImagePath = photoFile.absolutePath, quad = targetQuad)
+                    val page = ScannedPage(
+                        id = pageId,
+                        originalImagePath = photoFile.absolutePath,
+                        quad = targetQuad,
+                        status = PageStatus.READY
+                    )
                     PageRepository.addPage(page)
                     withContext(Dispatchers.Main) { onPageSaved(page.id) }
                 }

@@ -30,6 +30,7 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.min
+import com.scanner.app.domain.model.PageStatus
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -144,7 +145,8 @@ fun CameraScreen(
     )
 
     val lastPage = capturedPages.lastOrNull()
-    val lastThumbnailBitmap = remember(lastPage?.id, lastPage?.thumbnailPath, lastPage?.imagePath) {
+    val vmThumbnailBitmap by viewModel.lastThumbnailBitmap.collectAsState()
+    val diskThumbnailBitmap = remember(lastPage?.id, lastPage?.thumbnailPath, lastPage?.imagePath) {
         val path = lastPage?.thumbnailPath ?: lastPage?.imagePath
         if (path != null) {
             val file = File(path)
@@ -159,6 +161,8 @@ fun CameraScreen(
             } else null
         } else null
     }
+    val effectiveThumbnail = vmThumbnailBitmap ?: diskThumbnailBitmap
+    val hasProcessingPages = capturedPages.any { it.status == PageStatus.PROCESSING }
 
     val galleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -609,9 +613,7 @@ fun CameraScreen(
                                     interactionSource = shutterInteractionSource,
                                     indication = null
                                 ) {
-                                    viewModel.capturePhoto(context) { pageId ->
-                                        onNavigateToCrop(pageId)
-                                    }
+                                    viewModel.capturePhoto(context)
                                 },
                             contentAlignment = Alignment.Center
                         ) {
@@ -645,9 +647,9 @@ fun CameraScreen(
                                 .clickable { onNavigateToReview() },
                             contentAlignment = Alignment.Center
                         ) {
-                            if (lastThumbnailBitmap != null) {
+                            if (effectiveThumbnail != null) {
                                 Image(
-                                    bitmap = lastThumbnailBitmap.asImageBitmap(),
+                                    bitmap = effectiveThumbnail.asImageBitmap(),
                                     contentDescription = stringResource(R.string.review),
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier
@@ -660,6 +662,14 @@ fun CameraScreen(
                                     contentDescription = stringResource(R.string.review),
                                     tint = Color.White,
                                     modifier = Modifier.size(24.dp)
+                                )
+                            }
+
+                            if (hasProcessingPages) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(24.dp),
+                                    color = Color(0xFFFFB74D),
+                                    strokeWidth = 2.dp
                                 )
                             }
 

@@ -2,6 +2,12 @@ package com.scanner.app.domain.model
 
 import java.util.UUID
 
+enum class PageStatus {
+    PROCESSING,
+    READY,
+    FAILED
+}
+
 data class ScannedPage(
     val id: String = UUID.randomUUID().toString(),
     val originalImagePath: String,
@@ -12,7 +18,8 @@ data class ScannedPage(
     val filter: ImageFilter = ImageFilter.MAGIC_COLOR,
     val rotation: Int = 0, // 0, 90, 180, 270
     val targetAspectRatio: Float? = null,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    val status: PageStatus = PageStatus.READY
 ) {
     val imagePath: String
         get() = processedImagePath ?: originalImagePath
@@ -26,7 +33,8 @@ data class ScannedPage(
         filter: ImageFilter = ImageFilter.MAGIC_COLOR,
         rotation: Int = 0,
         targetAspectRatio: Float? = null,
-        createdAt: Long = System.currentTimeMillis()
+        createdAt: Long = System.currentTimeMillis(),
+        status: PageStatus = PageStatus.READY
     ) : this(
         id = id,
         originalImagePath = imagePath,
@@ -37,7 +45,8 @@ data class ScannedPage(
         filter = filter,
         rotation = rotation,
         targetAspectRatio = targetAspectRatio,
-        createdAt = createdAt
+        createdAt = createdAt,
+        status = status
     )
 }
 

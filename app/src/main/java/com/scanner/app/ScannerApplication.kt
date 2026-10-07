@@ -24,5 +24,16 @@ class ScannerApplication : Application() {
                 AppCompatDelegate.setApplicationLocales(LocaleListCompat.forLanguageTags(tag))
             }
         }
+
+        // Clean legacy orphaned temp files in cacheDir on launch
+        try {
+            cacheDir.listFiles()?.forEach { file ->
+                if (file.isFile && (file.name.startsWith("hdr_") || file.name.endsWith(".jpg"))) {
+                    file.delete()
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 }

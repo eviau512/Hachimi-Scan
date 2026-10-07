@@ -78,8 +78,14 @@ static bool alignmentScores(const cv::Mat& src, const cv::Mat& ref, const cv::Ma
         cv::warpPerspective(gs, gsWarp, Hs, gr.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
         cv::warpPerspective(ones, vmask, Hs, gr.size(), cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
 
+        // [SPEC_02 §2.5.3 v24] 全图估算曝光亮度比 (lumaRatio)，绝不可受局部掩模裁剪影响，
+        // 彻底杜绝超短曝光帧 (Tier 3) 因掩模有效像素<1000 导致 mean 归零并误判为 sameExposure=1！
+        double mRefAll = cv::mean(gr)[0];
+        double mSrcAll = cv::mean(gs)[0];
+        lumaRatio = (mRefAll > 0.01) ? (mSrcAll / mRefAll) : 1.0;
+
         auto zncc = [](const cv::Mat& a, const cv::Mat& b, const cv::Mat& mask) {
-            if (cv::countNonZero(mask) < 1000) return -1.0;
+            if (cv::countNonZero(mask) < 200) return -1.0;
             cv::Scalar ma, sa, mb, sb;
             cv::meanStdDev(a, ma, sa, mask);
             cv::meanStdDev(b, mb, sb, mask);
@@ -92,9 +98,11 @@ static bool alignmentScores(const cv::Mat& src, const cv::Mat& ref, const cv::Ma
         cv::Mat idOk = (gs >= 4) & (gs <= 250) & refOk;
         zH = zncc(hpWarp, hpRef, warpOk);
         zI = zncc(hpSrc, hpRef, idOk);
-        double mRef = cv::mean(gr, warpOk)[0];
-        double mSrc = cv::mean(gsWarp, warpOk)[0];
-        lumaRatio = (mRef > 1.0) ? (mSrc / mRef) : 1.0;
+        if (cv::countNonZero(warpOk) >= 200) {
+            double mRef = cv::mean(gr, warpOk)[0];
+            double mSrc = cv::mean(gsWarp, warpOk)[0];
+            if (mRef > 1.0) lumaRatio = mSrc / mRef;
+        }
         return true;
     } catch (const std::exception& e) {
         LOGW("alignmentScores exception: %s", e.what());
@@ -903,11 +911,11 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
 
         for (size_t k = 1; k < tier1.size(); ++k) {
             cv::Mat warped1x, H;
-            // [SPEC_02 §2.4 v23] Tier 1 相同曝光：ECC 优先 (光度不变、亚像素精度，已修正 ref→src 方向)，
-            // 其次 CLAHE ORB，最后对数梯度相位相关。每个候选均经位移场限幅 + 高通 ZNCC 结构校验。
-            bool alignedT1 = alignFrameECC(tier1[k], tier1[0], warped1x, H);
+            // [SPEC_02 §2.5.1 v24] Tier 1 全局单应性优先：ORB RANSAC Homography 求解 8-DOF 仿射/透视变换，
+            // 彻底解决手持俯仰/偏航倾斜造成的屏幕梯形失真与四角残差；失败时回退至光度不变 ECC 与相位相关。
+            bool alignedT1 = alignFrameHomography(tier1[k], tier1[0], warped1x, H);
             if (!alignedT1) {
-                alignedT1 = alignFrameHomography(tier1[k], tier1[0], warped1x, H);
+                alignedT1 = alignFrameECC(tier1[k], tier1[0], warped1x, H);
             }
             if (!alignedT1) {
                 alignedT1 = alignGradientPhaseCorrelation(tier1[k], tier1[0], warped1x, H);
@@ -918,9 +926,9 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
             }
             LOGI("Tier 1 Frame %zu aligned: max displacement field=%.1fpx", k, maxDisplacement(H, rows, cols));
 
-            // [SPEC_02 §2.4.2 / MotoCam Parity] Edge-MAD 结构对齐校验 (bDropGhost) —— 噪声自适应：
-            // 1. 全采样点帧间绝对差的中位数估计平坦区噪声 m_flat = 1.183 * median
-            // 2. 边缘判据 grad > max(20, 4.5σ_n)，丢弃门限 max(18, 1.7·m_flat + 4)
+            // [SPEC_02 §2.4.2 / §2.5.1 v24] Edge-MAD 结构对齐粗筛：
+            // 粗筛阈值放宽至 max(38, 4.5·m_flat + 15)，仅防剧烈场景运动与手抖漂移，
+            // 绝不误杀文字边缘残差，细节质量交由 32x32 分块运动门控进行局部自适应判定！
             const int edgeGradThr = static_cast<int>(std::max(20.0f, 4.5f * sigmaNoise));
             float edgeDiffSum = 0.0f;
             int edgeCount = 0;
@@ -931,7 +939,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 const cv::Vec3b* pBWarp = warped1x.ptr<cv::Vec3b>(y);
                 const cv::Vec3b* pBDown = (y + 4 < rows) ? tier1[0].ptr<cv::Vec3b>(y + 4) : pB0;
                 for (int x = 0; x < cols; x += 4) {
-                    if (pBWarp[x][0] == 0 && pBWarp[x][1] == 0 && pBWarp[x][2] == 0) continue;  // 配准后的无效边界
+                    if (pBWarp[x][0] == 0 && pBWarp[x][1] == 0 && pBWarp[x][2] == 0) continue;
                     int xNext = (x + 4 < cols) ? x + 4 : x;
                     int y0 = (29 * pB0[x][0] + 150 * pB0[x][1] + 77 * pB0[x][2]) >> 8;
                     int yR = (29 * pB0[xNext][0] + 150 * pB0[xNext][1] + 77 * pB0[xNext][2]) >> 8;
@@ -953,13 +961,59 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 madFlat = 1.183f * static_cast<float>(allDiffs[mid]);
             }
             float madEdge = (edgeCount > 100) ? (edgeDiffSum / static_cast<float>(edgeCount)) : 0.0f;
-            const float dropThr = std::max(18.0f, 1.7f * madFlat + 4.0f);
+            const float dropThr = std::max(38.0f, 4.5f * madFlat + 15.0f);
             LOGI("Tier 1 Frame %zu Edge-MAD check: edgeCount=%d, MAD_edge=%.2f, MAD_flat=%.2f, dropThr=%.2f",
                  k, edgeCount, madEdge, madFlat, dropThr);
             if (madEdge > dropThr) {
                 LOGW("Tier 1 Frame %zu structural mismatch (MAD_edge=%.2f > %.2f) -> DROPPED (De-motion Guard)", k, madEdge, dropThr);
                 continue;
             }
+
+            // [SPEC_02 §2.5.1 v24] 分块残差与局部运动门控 (Tile-Level Motion Gating)
+            // 划分 32x32 分块，逐块检测局部配准精度；若局部存在卷帘快门畸变或残差，该分块权重置 0，100% 直通基准帧
+            const int tileSize = 32;
+            const int tilesY = (rows + tileSize - 1) / tileSize;
+            const int tilesX = (cols + tileSize - 1) / tileSize;
+            cv::Mat tileWeights(tilesY, tilesX, CV_32FC1, cv::Scalar(1.0f));
+
+            const float tileDropThr = std::max(18.0f, 2.0f * madFlat + 6.0f);
+            const float tileOkThr   = std::max(9.0f,  1.1f * madFlat + 3.0f);
+
+            for (int ty = 0; ty < tilesY; ++ty) {
+                int yStart = ty * tileSize;
+                int yEnd = std::min(rows, yStart + tileSize);
+                for (int tx = 0; tx < tilesX; ++tx) {
+                    int xStart = tx * tileSize;
+                    int xEnd = std::min(cols, xStart + tileSize);
+
+                    float diffSum = 0.0f;
+                    int count = 0;
+                    for (int py = yStart; py < yEnd; py += 2) {
+                        const cv::Vec3b* pB0 = tier1[0].ptr<cv::Vec3b>(py);
+                        const cv::Vec3b* pBW = warped1x.ptr<cv::Vec3b>(py);
+                        for (int px = xStart; px < xEnd; px += 2) {
+                            if (pBW[px][0] == 0 && pBW[px][1] == 0 && pBW[px][2] == 0) continue;
+                            int y0 = (29 * pB0[px][0] + 150 * pB0[px][1] + 77 * pB0[px][2]) >> 8;
+                            int yw = (29 * pBW[px][0] + 150 * pBW[px][1] + 77 * pBW[px][2]) >> 8;
+                            diffSum += std::abs(y0 - yw);
+                            count++;
+                        }
+                    }
+                    if (count > 8) {
+                        float avgDiff = diffSum / static_cast<float>(count);
+                        if (avgDiff >= tileDropThr) {
+                            tileWeights.at<float>(ty, tx) = 0.0f;
+                        } else if (avgDiff <= tileOkThr) {
+                            tileWeights.at<float>(ty, tx) = 1.0f;
+                        } else {
+                            tileWeights.at<float>(ty, tx) = (tileDropThr - avgDiff) / (tileDropThr - tileOkThr);
+                        }
+                    }
+                }
+            }
+
+            cv::Mat wGateSuper;
+            cv::resize(tileWeights, wGateSuper, cv::Size(superCols, superRows), 0, 0, cv::INTER_LINEAR);
 
             // 噪声自适应光度截止与时域高斯核
             const int idiffCut = static_cast<int>(std::clamp(3.5f * madFlat, 16.0f, 90.0f));
@@ -979,10 +1033,14 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 const cv::Vec3b* pBase = baseSuper.ptr<cv::Vec3b>(y);
                 const cv::Vec3b* pCand = candWarpedSuper.ptr<cv::Vec3b>(y);
                 const float* pM = mEdgeMat.ptr<float>(y);
+                const float* pGate = wGateSuper.ptr<float>(y);
                 cv::Vec3f* pAccum = accum.ptr<cv::Vec3f>(y);
                 float* pWeight = weights.ptr<float>(y);
 
                 for (int x = 0; x < superCols; ++x) {
+                    float wGate = pGate[x];
+                    if (wGate <= 0.02f) continue;
+
                     const cv::Vec3b& bk = pCand[x];
                     if (bk[0] == 0 && bk[1] == 0 && bk[2] == 0) continue;
 
@@ -998,7 +1056,7 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                     // [SPEC_02 §2.4.2 v23: 噪声自适应光度截止] max(16, 3.5·m_flat)，高 ISO 下不再误杀纯噪声差异
                     if (idiff > idiffCut) continue;
 
-                    float w = (1.0f - mEdge) * localLUT[idiff];
+                    float w = (1.0f - mEdge) * localLUT[idiff] * wGate;
                     if (w > 0.04f) {
                         pAccum[x][0] += w * static_cast<float>(bk[0]);
                         pAccum[x][1] += w * static_cast<float>(bk[1]);
@@ -1234,7 +1292,10 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                 cv::resize(I_short_12M, shortSmooth50M, cv::Size(superCols, superRows), 0, 0, cv::INTER_LINEAR);
             }
 
-            // 基准帧绝对锁定与高光单向保边嫁接 (SPEC_02 §3.5)
+            // 基准帧绝对锁定与高光单向保边嫁接 (SPEC_02 §2.5.4 / §3.5)
+            // 1. 仅在亮度 (Y) 维度嫁接高光，色度 (Cr, Cb) 100% 继承自基准帧，杜绝图标白区偏色变灰
+            // 2. 扁平中性白色区 (UI 图标内部) 限制下拉幅度 (保持 Y >= 238)，杜绝中空半透明灰白
+            // 3. 仅对短曝光板具有真实结构反差的高光 (灯丝/强反光/透光字) 启用完整 HDR 色调映射
             superResult = cv::Mat(superRows, superCols, CV_8UC3);
             #pragma omp parallel for schedule(static)
             for (int y = 0; y < superRows; ++y) {
@@ -1255,7 +1316,11 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                         continue;
                     }
 
-                    // 2. 高光单向嫁接 Hermite smoothstep 权重: 200~245 平滑接入 HDR 高光细节
+                    // 提取基准帧色度 (Cr, Cb)，确保高光嫁接 100% 保持基准帧色彩真实度
+                    float crBase = (static_cast<float>(bSuper[2]) - yBase) * 0.713f + 128.0f;
+                    float cbBase = (static_cast<float>(bSuper[0]) - yBase) * 0.564f + 128.0f;
+
+                    // 2. 高光单向嫁接 Hermite smoothstep 权重: 200~245 平滑接入
                     float u = std::clamp((yBase - 200.0f) / 45.0f, 0.0f, 1.0f);
                     float wHdr = u * u * (3.0f - 2.0f * u);
 
@@ -1263,17 +1328,37 @@ cv::Mat BurstFusionEngine::fuseBurstFrames(
                     float yHdr = 0.114f * static_cast<float>(f[0]) + 0.587f * static_cast<float>(f[1]) + 0.299f * static_cast<float>(f[2]);
                     float alphaShort = std::clamp((yHdr - 210.0f) / 40.0f, 0.0f, 1.0f);
 
-                    for (int c = 0; c < 3; ++c) {
-                        float dBase = static_cast<float>(bSuper[c]) - static_cast<float>(pBaseSmooth[x][c]);
-                        float dShort = 0.0f;
-                        if (hasShortDetail) {
-                            dShort = static_cast<float>(pShortSuper[x][c]) - static_cast<float>(pShortSmooth[x][c]);
-                        }
-                        float detail = (1.0f - alphaShort) * dBase + alphaShort * dShort;
-                        float vHdr = static_cast<float>(f[c]) + detail;
-                        float vFinal = (1.0f - wHdr) * static_cast<float>(bSuper[c]) + wHdr * vHdr;
-                        pOut[x][c] = cv::saturate_cast<uchar>(vFinal);
+                    // 3. 计算亮度高频细节
+                    float yBaseSmooth = 0.114f * static_cast<float>(pBaseSmooth[x][0]) + 0.587f * static_cast<float>(pBaseSmooth[x][1]) + 0.299f * static_cast<float>(pBaseSmooth[x][2]);
+                    float dBase_Y = yBase - yBaseSmooth;
+                    float dShort_Y = 0.0f;
+                    float gradShort = 0.0f;
+                    if (hasShortDetail) {
+                        float yShort = 0.114f * static_cast<float>(pShortSuper[x][0]) + 0.587f * static_cast<float>(pShortSuper[x][1]) + 0.299f * static_cast<float>(pShortSuper[x][2]);
+                        float yShortSmooth = 0.114f * static_cast<float>(pShortSmooth[x][0]) + 0.587f * static_cast<float>(pShortSmooth[x][1]) + 0.299f * static_cast<float>(pShortSmooth[x][2]);
+                        dShort_Y = yShort - yShortSmooth;
+                        gradShort = std::abs(dShort_Y);
                     }
+                    float detail_Y = (1.0f - alphaShort) * dBase_Y + alphaShort * dShort_Y;
+
+                    // 4. 判断中性白区域与高光结构: 若属于平板 UI/图标等平坦中性白，限制下拉幅度
+                    bool isNeutralWhite = (std::abs(crBase - 128.0f) < 14.0f && std::abs(cbBase - 128.0f) < 14.0f);
+                    float yHdrGraft = yHdr + detail_Y;
+                    if (isNeutralWhite && gradShort < 6.0f) {
+                        // 扁平白无内部纹理: 保持纯白，最多微调 10 阶
+                        yHdrGraft = std::max(yBase - 10.0f, 238.0f);
+                    }
+
+                    float yFinal = (1.0f - wHdr) * yBase + wHdr * yHdrGraft;
+
+                    // 5. YCrCb -> BGR 重建 (色彩由基准帧绝对主导)
+                    float r = yFinal + 1.402f * (crBase - 128.0f);
+                    float g = yFinal - 0.344136f * (cbBase - 128.0f) - 0.714136f * (crBase - 128.0f);
+                    float b = yFinal + 1.772f * (cbBase - 128.0f);
+
+                    pOut[x][0] = cv::saturate_cast<uchar>(b);
+                    pOut[x][1] = cv::saturate_cast<uchar>(g);
+                    pOut[x][2] = cv::saturate_cast<uchar>(r);
                 }
             }
             LOGI("50MP Base-Locked Highlight Grafting HDR Fusion completed!");

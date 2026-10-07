@@ -64,6 +64,7 @@ import com.scanner.app.domain.model.ImageFilter
 import com.scanner.app.ui.components.AspectRatioBanner
 import com.scanner.app.ui.export.ExportDialog
 import com.scanner.app.ui.theme.PrismCyan
+import com.scanner.app.ui.theme.SteadyEmerald
 import java.io.File
 import kotlinx.coroutines.launch
 
@@ -515,7 +516,7 @@ fun ReviewScreen(
                         elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 6.dp else 2.dp)
                     ) {
                         Box(modifier = Modifier.fillMaxSize()) {
-                            if (bitmap != null) {
+                            if (bitmap != null && page.status != com.scanner.app.domain.model.PageStatus.PROCESSING) {
                                 Image(
                                     bitmap = bitmap.asImageBitmap(),
                                     contentDescription = "Page ${index + 1}",
@@ -527,10 +528,20 @@ fun ReviewScreen(
                                     modifier = Modifier.fillMaxSize(),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(28.dp),
-                                        strokeWidth = 2.5.dp
-                                    )
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(28.dp),
+                                            color = SteadyEmerald,
+                                            strokeWidth = 2.5.dp
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "HDR...",
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
                                 }
                             }
 
@@ -620,7 +631,8 @@ fun ReviewScreen(
             rotationAngle.snapTo(0.0f)
         }
 
-        val detailBitmap = remember(page.imagePath, imageVersion) {
+        val detailBitmap = remember(page.imagePath, imageVersion, page.status) {
+            if (page.status == com.scanner.app.domain.model.PageStatus.PROCESSING) return@remember null
             val file = File(page.imagePath)
             if (file.exists()) {
                 val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }

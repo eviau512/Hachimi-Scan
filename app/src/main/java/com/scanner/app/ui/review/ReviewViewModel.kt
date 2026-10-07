@@ -46,6 +46,16 @@ class ReviewViewModel : ViewModel() {
         if (_selectedPageId.value == pageId) {
             _selectedPageId.value = null
         }
+        val page = PageRepository.getPage(pageId)
+        if (page != null) {
+            try {
+                File(page.originalImagePath).delete()
+                page.processedImagePath?.let { File(it).delete() }
+                page.thumbnailPath?.let { File(it).delete() }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
         PageRepository.deletePage(pageId)
     }
 
@@ -176,6 +186,16 @@ class ReviewViewModel : ViewModel() {
         for (pageId in pageIds) {
             if (_selectedPageId.value == pageId) {
                 _selectedPageId.value = null
+            }
+            val page = PageRepository.getPage(pageId)
+            if (page != null) {
+                try {
+                    File(page.originalImagePath).delete()
+                    page.processedImagePath?.let { File(it).delete() }
+                    page.thumbnailPath?.let { File(it).delete() }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
             PageRepository.deletePage(pageId)
         }

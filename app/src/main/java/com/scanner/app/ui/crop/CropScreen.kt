@@ -76,6 +76,7 @@ fun CropScreen(
     val customRatioValue by viewModel.customRatioValue.collectAsState()
     val imagePath by viewModel.imagePath.collectAsState()
     val imageVersion by viewModel.imageVersion.collectAsState()
+    val isProcessing by viewModel.isProcessing.collectAsState()
     var isSaving by remember { mutableStateOf(false) }
 
     val coroutineScope = rememberCoroutineScope()
@@ -103,7 +104,7 @@ fun CropScreen(
                 },
                 actions = {
                     IconButton(
-                        enabled = !isRotating && !isSaving,
+                        enabled = !isRotating && !isSaving && !isProcessing,
                         onClick = {
                             isRotating = true
                             coroutineScope.launch {
@@ -130,7 +131,7 @@ fun CropScreen(
                         )
                     }
                     IconButton(
-                        enabled = !isRotating && !isSaving,
+                        enabled = !isRotating && !isSaving && !isProcessing,
                         onClick = { viewModel.resetToFullImage() }
                     ) {
                         Icon(
@@ -140,7 +141,7 @@ fun CropScreen(
                         )
                     }
                     IconButton(
-                        enabled = !isRotating && !isSaving,
+                        enabled = !isRotating && !isSaving && !isProcessing,
                         onClick = { viewModel.reDetect() }
                     ) {
                         Icon(
@@ -223,7 +224,7 @@ fun CropScreen(
 
                         // Confirm Action Button
                         Button(
-                            enabled = !isSaving && !isRotating,
+                            enabled = !isSaving && !isRotating && !isProcessing,
                             onClick = {
                                 isSaving = true
                                 viewModel.confirmCrop {
@@ -272,69 +273,94 @@ fun CropScreen(
             val containerW = constraints.maxWidth.toFloat()
             val containerH = constraints.maxHeight.toFloat()
 
-            val (origW, origH) = remember(imagePath, imageVersion) {
-                imagePath?.let { getUprightDimensions(it) } ?: Pair(0f, 0f)
-            }
-
-            val bitmap = remember(imagePath, imageVersion) {
-                imagePath?.let { path ->
-                    loadUprightBitmap(path)
-                }
-            }
-
-            LaunchedEffect(bitmap, origW, origH) {
-                if (bitmap != null) {
-                    viewModel.onBitmapLoaded(bitmap, origW, origH)
-                }
-            }
-
-            // Continuous rotation scale compensation:
-            // When rotating 90 deg, fit the rotated aspect ratio without clipping or layout jumping
-            val targetScale = remember(bitmap, containerW, containerH) {
-                if (bitmap != null && bitmap.width > 0 && bitmap.height > 0 && containerW > 0 && containerH > 0) {
-                    val bw = bitmap.width.toFloat()
-                    val bh = bitmap.height.toFloat()
-                    val sOrig = kotlin.math.min(containerW / bw, containerH / bh)
-                    val sRot = kotlin.math.min(containerW / bh, containerH / bw)
-                    if (sOrig > 0f) sRot / sOrig else 1.0f
-                } else 1.0f
-            }
-
-            val rotProgress = (rotationAngle.value / 90f).coerceIn(0f, 1f)
-            val dynamicScale = 1.0f + (targetScale - 1.0f) * rotProgress
-
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        scaleX = dynamicScale
-                        scaleY = dynamicScale
-                        rotationZ = rotationAngle.value
+            if (isProcessing) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(48.dp),
+                            color = SteadyEmerald,
+                            strokeWidth = 3.5.dp
+                        )
+                        Spacer(modifier = Modifier.height(18.dp))
+                        Text(
+                            text = "正在进行高动态多帧超分融合...",
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
-            ) {
-                QuadCropView(
-                    bitmap = bitmap,
-                    quad = currentQuad,
-                    detectedQuad = detectedQuad,
-                    edgeMatAddr = edgeMatAddr,
-                    horizontalLines = horizontalLines,
-                    verticalLines = verticalLines,
-                    originalWidth = origW,
-                    originalHeight = origH,
-                    onCornerUpdated = { cornerIndex, newPosition ->
-                        viewModel.updateCorner(cornerIndex, newPosition)
-                    },
-                    onEdgeUpdated = { edgeIndex, deltaX, deltaY ->
-                        viewModel.updateEdge(edgeIndex, deltaX, deltaY)
-                    },
-                    onQuadChanged = { newQuad ->
-                        viewModel.updateQuad(newQuad)
-                    },
-                    onTapToSnap = { x, y ->
-                        viewModel.tapToSnap(x, y)
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
+                }
+            } else {
+                val (origW, origH) = remember(imagePath, imageVersion) {
+                    imagePath?.let { getUprightDimensions(it) } ?: Pair(0f, 0f)
+                }
+
+                val bitmap = remember(imagePath, imageVersion) {
+                    imagePath?.let { path ->
+                        loadUprightBitmap(path)
+                    }
+                }
+
+                LaunchedEffect(bitmap, origW, origH) {
+                    if (bitmap != null) {
+                        viewModel.onBitmapLoaded(bitmap, origW, origH)
+                    }
+                }
+
+                // Continuous rotation scale compensation:
+                // When rotating 90 deg, fit the rotated aspect ratio without clipping or layout jumping
+                val targetScale = remember(bitmap, containerW, containerH) {
+                    if (bitmap != null && bitmap.width > 0 && bitmap.height > 0 && containerW > 0 && containerH > 0) {
+                        val bw = bitmap.width.toFloat()
+                        val bh = bitmap.height.toFloat()
+                        val sOrig = kotlin.math.min(containerW / bw, containerH / bh)
+                        val sRot = kotlin.math.min(containerW / bh, containerH / bw)
+                        if (sOrig > 0f) sRot / sOrig else 1.0f
+                    } else 1.0f
+                }
+
+                val rotProgress = (rotationAngle.value / 90f).coerceIn(0f, 1f)
+                val dynamicScale = 1.0f + (targetScale - 1.0f) * rotProgress
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = dynamicScale
+                            scaleY = dynamicScale
+                            rotationZ = rotationAngle.value
+                        }
+                ) {
+                    QuadCropView(
+                        bitmap = bitmap,
+                        quad = currentQuad,
+                        detectedQuad = detectedQuad,
+                        edgeMatAddr = edgeMatAddr,
+                        horizontalLines = horizontalLines,
+                        verticalLines = verticalLines,
+                        originalWidth = origW,
+                        originalHeight = origH,
+                        onCornerUpdated = { cornerIndex, newPosition ->
+                            viewModel.updateCorner(cornerIndex, newPosition)
+                        },
+                        onEdgeUpdated = { edgeIndex, deltaX, deltaY ->
+                            viewModel.updateEdge(edgeIndex, deltaX, deltaY)
+                        },
+                        onQuadChanged = { newQuad ->
+                            viewModel.updateQuad(newQuad)
+                        },
+                        onTapToSnap = { x, y ->
+                            viewModel.tapToSnap(x, y)
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
             }
 
             AnimatedVisibility(

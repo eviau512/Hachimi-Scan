@@ -133,4 +133,26 @@ object ExifUtils {
             e.printStackTrace()
         }
     }
+
+    fun copyAndStampExif(srcBytes: ByteArray, dstFile: File, mode: String? = null) {
+        if (!dstFile.exists()) return
+        try {
+            val dstExif = ExifInterface(dstFile.absolutePath)
+            java.io.ByteArrayInputStream(srcBytes).use { inStream ->
+                val srcExif = ExifInterface(inStream)
+                for (tag in CAMERA_TAGS) {
+                    val value = srcExif.getAttribute(tag)
+                    if (value != null) {
+                        dstExif.setAttribute(tag, value)
+                    }
+                }
+                dstExif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
+                val effectiveMode = mode ?: extractMode(srcExif)
+                stampSignature(dstExif, effectiveMode)
+                dstExif.saveAttributes()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
 }

@@ -59,6 +59,11 @@ class CropViewModel : ViewModel() {
     private val _detectedQuad = MutableStateFlow<DocumentQuad?>(null)
     val detectedQuad: StateFlow<DocumentQuad?> = _detectedQuad.asStateFlow()
 
+    private val _isProcessing = MutableStateFlow(false)
+    val isProcessing: StateFlow<Boolean> = _isProcessing.asStateFlow()
+
+    private var pageObserveJob: Job? = null
+
     private var grayMat: Mat? = null
     private var edgeMat: Mat? = null
     private var edgeJob: Job? = null
@@ -160,6 +165,28 @@ class CropViewModel : ViewModel() {
     fun loadPage(pageId: String) {
         currentPageId = pageId
         val page = PageRepository.getPage(pageId) ?: return
+
+        if (page.status == com.scanner.app.domain.model.PageStatus.PROCESSING) {
+            _isProcessing.value = true
+            pageObserveJob?.cancel()
+            pageObserveJob = viewModelScope.launch {
+                PageRepository.pages.collect { pages ->
+                    val updated = pages.find { it.id == pageId }
+                    if (updated != null && updated.status != com.scanner.app.domain.model.PageStatus.PROCESSING) {
+                        _isProcessing.value = false
+                        applyPage(updated)
+                        pageObserveJob?.cancel()
+                    }
+                }
+            }
+            return
+        }
+
+        _isProcessing.value = false
+        applyPage(page)
+    }
+
+    private fun applyPage(page: ScannedPage) {
         val savedRatio = page.targetAspectRatio
         val matchedPreset = AspectRatioPreset.fromRatio(savedRatio)
         _selectedRatio.value = matchedPreset
