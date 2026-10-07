@@ -43,16 +43,8 @@ class ReviewViewModel : ViewModel() {
     }
 
     fun deletePage(pageId: String) {
-        val page = PageRepository.getPage(pageId)
         if (_selectedPageId.value == pageId) {
             _selectedPageId.value = null
-        }
-        page?.let {
-            try {
-                File(it.originalImagePath).delete()
-                it.processedImagePath?.let { p -> File(p).delete() }
-                it.thumbnailPath?.let { t -> File(t).delete() }
-            } catch (_: Exception) {}
         }
         PageRepository.deletePage(pageId)
     }
@@ -182,16 +174,8 @@ class ReviewViewModel : ViewModel() {
 
     fun deleteBatchPages(pageIds: Collection<String>) {
         for (pageId in pageIds) {
-            val page = PageRepository.getPage(pageId)
             if (_selectedPageId.value == pageId) {
                 _selectedPageId.value = null
-            }
-            page?.let {
-                try {
-                    File(it.originalImagePath).delete()
-                    it.processedImagePath?.let { p -> File(p).delete() }
-                    it.thumbnailPath?.let { t -> File(t).delete() }
-                } catch (_: Exception) {}
             }
             PageRepository.deletePage(pageId)
         }

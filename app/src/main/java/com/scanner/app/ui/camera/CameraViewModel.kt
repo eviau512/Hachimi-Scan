@@ -166,8 +166,7 @@ class CameraViewModel : ViewModel() {
 
     private fun captureSinglePhoto(context: Context, capture: ImageCapture, onPageSaved: (String) -> Unit) {
         _isCapturing.value = true
-        val storage = com.scanner.app.data.image.ImageStorage(context)
-        val photoFile = File(storage.getStorageDir(), "${UUID.randomUUID()}.jpg")
+        val photoFile = File(context.cacheDir, "${UUID.randomUUID()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
         val executor = ContextCompat.getMainExecutor(context)
 
@@ -205,21 +204,19 @@ class CameraViewModel : ViewModel() {
     }
 
     // ─────────────────────────────────────────────
-    // Apple Deep Fusion / Smart HDR 7-Frame Unified Capture Pipeline
+    // Apple Deep Fusion / Smart HDR 9-Frame Capture Pipeline
     //
-    // Frame sequence (7 frames total):
+    // Frame sequence (9 frames total):
     //   Tier 1 (4 frames, EV 0):
     //     Frames 0, 1, 2, 3: AE locked, base exposure & sub-pixel super-res anchors
-    //   Tier 2 (2 frames, EV -2.5):
-    //     Frames 4, 5: Manual midtone exposure transition
-    //   Tier 3 (1 frame, EV -6.0):
-    //     Frame 6: Manual deep highlight recovery
+    //   Tier 2 (3 frames, EV -2.5):
+    //     Frames 4, 5, 6: Manual midtone exposure transition
+    //   Tier 3 (2 frames, EV -5.0):
+    //     Frames 7, 8: Manual deep highlight recovery (lamp bulb/filament un-saturation)
     //
-    // 异步连拍架构 [SPEC_01 §7 / SPEC_02 §2.5]:
-    // 1. 内存零磁盘连拍: 帧数据直接拉取至 RAM，避免每帧写磁盘造成的 IO 阻塞
-    // 2. 拍摄后秒回取景: 连拍完成后瞬间停止转圈，立即恢复取景画面供用户继续操作
-    // 3. 后台并发融合计算: 对齐与 Mertens 超分融合由后台协程异步处理
-    // 4. 持久化存储规范: 照片直接存入 filesDir/scans/，不再占用系统 cacheDir 空间
+    // All frames are fused by OpenCV MergeMertens multi-scale Laplacian pyramid
+    // + 50MP sub-pixel high-frequency detail transfer.
+    // Output: ~50MP JPEG @ quality 95, EXIF mode = "Full HDR"
     // ─────────────────────────────────────────────
 
     private fun captureFullHdrPhoto(context: Context, capture: ImageCapture, onPageSaved: (String) -> Unit) {
@@ -234,34 +231,39 @@ class CameraViewModel : ViewModel() {
                     }
                 }
 
-                val tier1Bytes = mutableListOf<ByteArray>()
-                val tier2Bytes = mutableListOf<ByteArray>()
-                val tier3Bytes = mutableListOf<ByteArray>()
+                val tier1Files = mutableListOf<File>()
+                val tier2Files = mutableListOf<File>()
+                val tier3Files = mutableListOf<File>()
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 1: 4 帧正常曝光 (EV 0) 内存快速连拍 (无磁盘 IO)
+                // Tier 1: 4 帧正常曝光 (EV 0) — 50MP 亚像素超分与暗部降噪核心锚点
                 // ─────────────────────────────────────────────────────────────
-                for (i in 0 until 4) {
-                    val bytes = takeSinglePictureInMemory(capture, context)
-                    if (bytes != null && bytes.isNotEmpty()) {
-                        tier1Bytes.add(bytes)
+                coroutineScope {
+                    val t1Jobs = (0 until 4).map { i ->
+                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t1_$i.jpg")
+                        async {
+                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
+                        }
                     }
+                    tier1Files.addAll(t1Jobs.awaitAll().filterNotNull())
                 }
 
-                if (tier1Bytes.isEmpty()) {
+                if (tier1Files.isEmpty()) {
                     _isCapturing.value = false
                     return@launch
                 }
 
-                // 从内存 Frame 0 解析曝光参数
-                val file0Bytes = tier1Bytes[0]
-                val (baseIso, baseExpSec) = try {
-                    val ex0 = ExifInterface(java.io.ByteArrayInputStream(file0Bytes))
-                    val iso = ex0.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, 800).coerceAtLeast(100)
-                    val exp = parseExposureTime(ex0.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)) ?: 0.033
-                    Pair(iso, exp)
-                } catch (e: Exception) {
-                    Pair(800, 0.033)
+                // Inspect Frame 0 exposure parameters from EXIF
+                val file0 = tier1Files[0]
+                val baseIso: Int
+                val baseExpSec: Double
+                if (file0.exists()) {
+                    val ex0 = ExifInterface(file0.absolutePath)
+                    baseIso = ex0.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, 800).coerceAtLeast(100)
+                    baseExpSec = parseExposureTime(ex0.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)) ?: 0.033
+                } else {
+                    baseIso = 800
+                    baseExpSec = 0.033
                 }
 
                 // Tier 2 (-2.5 EV): Midtone Transition
@@ -282,109 +284,112 @@ class CameraViewModel : ViewModel() {
                 )
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 2: 2 帧中灰曝光 (-2.5 EV) 内存快速连拍
+                // Tier 2: 2 帧中灰曝光 (-2.5 EV) — 快速获取过渡中灰
                 // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     setManualCaptureOptions(control, context, midExpNanos, midIso)
-                    delay(25) // Sensor register latch
+                    delay(40) // Sensor register latch
                 }
-                for (i in 0 until 2) {
-                    val bytes = takeSinglePictureInMemory(capture, context)
-                    if (bytes != null && bytes.isNotEmpty()) {
-                        tier2Bytes.add(bytes)
+                coroutineScope {
+                    val t2Jobs = (0 until 2).map { i ->
+                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t2_$i.jpg")
+                        async {
+                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
+                        }
                     }
+                    tier2Files.addAll(t2Jobs.awaitAll().filterNotNull())
                 }
 
                 // ─────────────────────────────────────────────────────────────
-                // Tier 3: 1 帧短曝光 (-6.0 EV) 内存快速连拍
+                // Tier 3: 1 帧短曝光 (-6.0 EV) — 极速提取灯丝/灯芯与高光轮廓
                 // ─────────────────────────────────────────────────────────────
                 if (control != null) {
                     setManualCaptureOptions(control, context, shortExpNanos, shortIso)
-                    delay(25) // Sensor register latch
+                    delay(40) // Sensor register latch
                 }
-                for (i in 0 until 1) {
-                    val bytes = takeSinglePictureInMemory(capture, context)
-                    if (bytes != null && bytes.isNotEmpty()) {
-                        tier3Bytes.add(bytes)
+                coroutineScope {
+                    val t3Jobs = (0 until 1).map { i ->
+                        val f = File(context.cacheDir, "hdr_${UUID.randomUUID()}_t3_$i.jpg")
+                        async {
+                            if (takeSinglePicture(capture, context, f) && f.exists() && f.length() > 0) f else null
+                        }
                     }
+                    tier3Files.addAll(t3Jobs.awaitAll().filterNotNull())
                 }
 
-                // 连拍获取完毕，立即恢复相机自动曝光
+                // Restore Auto-Exposure immediately after burst capture
                 if (control != null) {
                     clearManualCaptureOptions(control, context)
                 }
 
-                // ─────────────────────────────────────────────────────────────
-                // 交互体验关键：连拍接收完成，立即解除转圈状态，立即恢复取景画面！
-                // ─────────────────────────────────────────────────────────────
-                _isCapturing.value = false
-                frameAnalyzer?.resetStability()
-
-                val allBytes = mutableListOf<ByteArray>().apply {
-                    addAll(tier1Bytes)
-                    addAll(tier2Bytes)
-                    addAll(tier3Bytes)
+                val allFiles = mutableListOf<File>().apply {
+                    addAll(tier1Files)
+                    addAll(tier2Files)
+                    addAll(tier3Files)
                 }
 
-                val storage = com.scanner.app.data.image.ImageStorage(context)
-                val pageId = UUID.randomUUID().toString()
-                val finalPhotoFile = File(storage.getStorageDir(), "${pageId}.jpg")
-
-                // 将 Frame 0 写入持久化存储 filesDir/scans/ 作为初始原图 (永不随系统清理 cacheDir 丢失)
-                FileOutputStream(finalPhotoFile).use { fos ->
-                    fos.write(file0Bytes)
+                allFiles.forEachIndexed { idx, f ->
+                    try {
+                        val ex = ExifInterface(f.absolutePath)
+                        val iso = ex.getAttribute(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
+                        val exp = ex.getAttribute(ExifInterface.TAG_EXPOSURE_TIME)
+                        android.util.Log.i("HachiCam-Burst", "Burst Frame $idx (total ${allFiles.size}): ISO=$iso, ExpTime=$exp, size=${f.length()} bytes")
+                    } catch (e: Exception) {
+                        android.util.Log.w("HachiCam-Burst", "Failed to inspect Frame $idx EXIF: ${e.message}")
+                    }
                 }
-                val (photoW, photoH) = normalizeExifOrientation(finalPhotoFile)
-                ExifUtils.stampSignature(finalPhotoFile, mode = "Full HDR")
 
+                val finalPhotoFile = File(context.cacheDir, "${UUID.randomUUID()}.jpg")
+
+                withContext(Dispatchers.IO) {
+                    val deferredMats = allFiles.map { file ->
+                        async(Dispatchers.IO) {
+                            Imgcodecs.imread(file.absolutePath)
+                        }
+                    }
+                    val mats = deferredMats.awaitAll().filter { !it.empty() }
+
+                    if (mats.isNotEmpty()) {
+                        val fusionEngine = NativeBurstFusion()
+                        val fusedMat = fusionEngine.fuseBurstFrames(
+                            burstFrames = mats,
+                            removeGlare = true,
+                            isScreenMode = true,
+                            superResolution = true
+                        )
+                        if (!fusedMat.empty()) {
+                            rotateAndSaveFusedMat(fusedMat, allFiles[0], finalPhotoFile, mode = "Full HDR", jpegQuality = 95)
+                        } else {
+                            allFiles[0].copyTo(finalPhotoFile, overwrite = true)
+                            normalizeExifOrientation(finalPhotoFile)
+                            ExifUtils.stampSignature(finalPhotoFile, mode = "Full HDR")
+                        }
+                        for (m in mats) m.release()
+                    } else {
+                        allFiles[0].copyTo(finalPhotoFile, overwrite = true)
+                        normalizeExifOrientation(finalPhotoFile)
+                        ExifUtils.stampSignature(finalPhotoFile, mode = "Full HDR")
+                    }
+
+                    for (f in allFiles) f.delete()
+                }
+
+                val (photoW, photoH) = getImageDimensions(finalPhotoFile)
                 val currentResult = _detectedQuad.value
                 val finalQuad = computeTargetQuad(currentResult, photoW, photoH)
 
                 val newPage = ScannedPage(
-                    id = pageId,
+                    id = UUID.randomUUID().toString(),
                     originalImagePath = finalPhotoFile.absolutePath,
                     quad = finalQuad,
                     filter = ImageFilter.MAGIC_COLOR
                 )
                 PageRepository.addPage(newPage)
-                onPageSaved(newPage.id)
 
-                // ─────────────────────────────────────────────────────────────
-                // 后台并发执行 Native 对齐与 Mertens 超分融合 (不阻塞主线程/取景)
-                // ─────────────────────────────────────────────────────────────
-                viewModelScope.launch(Dispatchers.Default) {
-                    try {
-                        val deferredMats = allBytes.map { b ->
-                            async(Dispatchers.IO) {
-                                val mob = org.opencv.core.MatOfByte(*b)
-                                val m = Imgcodecs.imdecode(mob, Imgcodecs.IMREAD_COLOR)
-                                mob.release()
-                                m
-                            }
-                        }
-                        val mats = deferredMats.awaitAll().filter { it != null && !it.empty() }
-
-                        if (mats.isNotEmpty()) {
-                            val fusionEngine = NativeBurstFusion()
-                            val fusedMat = fusionEngine.fuseBurstFrames(
-                                burstFrames = mats,
-                                removeGlare = true,
-                                isScreenMode = true,
-                                superResolution = true
-                            )
-                            if (!fusedMat.empty()) {
-                                rotateAndSaveFusedMat(fusedMat, finalPhotoFile, finalPhotoFile, mode = "Full HDR", jpegQuality = 95)
-                                val updatedPage = PageRepository.getPage(pageId)
-                                if (updatedPage != null) {
-                                    PageRepository.updatePage(updatedPage.copy(originalImagePath = finalPhotoFile.absolutePath))
-                                }
-                            }
-                            for (m in mats) m.release()
-                            fusedMat.release()
-                        }
-                    } catch (e: Exception) {
-                        android.util.Log.e("HachiCam-Burst", "Background fusion failed: ${e.message}", e)
-                    }
+                withContext(Dispatchers.Main) {
+                    _isCapturing.value = false
+                    frameAnalyzer?.resetStability()
+                    onPageSaved(newPage.id)
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -511,37 +516,6 @@ class CameraViewModel : ViewModel() {
         ExifUtils.copyAndStampExif(refFile, outFile, mode = mode)
     }
 
-    private suspend fun takeSinglePictureInMemory(
-        capture: ImageCapture,
-        context: Context
-    ): ByteArray? = suspendCancellableCoroutine { continuation ->
-        val executor = ContextCompat.getMainExecutor(context)
-        capture.takePicture(
-            executor,
-            object : ImageCapture.OnImageCapturedCallback() {
-                override fun onCaptureSuccess(image: androidx.camera.core.ImageProxy) {
-                    try {
-                        val plane = image.planes[0]
-                        val buffer = plane.buffer
-                        val bytes = ByteArray(buffer.remaining())
-                        buffer.get(bytes)
-                        if (continuation.isActive) continuation.resume(bytes)
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                        if (continuation.isActive) continuation.resume(null)
-                    } finally {
-                        image.close()
-                    }
-                }
-
-                override fun onError(exception: ImageCaptureException) {
-                    exception.printStackTrace()
-                    if (continuation.isActive) continuation.resume(null)
-                }
-            }
-        )
-    }
-
     private suspend fun takeSinglePicture(
         capture: ImageCapture,
         context: Context,
@@ -639,8 +613,7 @@ class CameraViewModel : ViewModel() {
     fun importFromUri(context: Context, uri: Uri, onPageSaved: (String) -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val storage = com.scanner.app.data.image.ImageStorage(context)
-                val photoFile = File(storage.getStorageDir(), "${java.util.UUID.randomUUID()}.jpg")
+                val photoFile = File(context.cacheDir, "${java.util.UUID.randomUUID()}.jpg")
                 context.contentResolver.openInputStream(uri)?.use { input ->
                     photoFile.outputStream().use { output -> input.copyTo(output) }
                 }

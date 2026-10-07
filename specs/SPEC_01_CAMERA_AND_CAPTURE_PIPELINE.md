@@ -156,7 +156,7 @@ Every saved image is inscribed with hardware and pipeline metadata:
 
 ### 7.6 Disk policy
 - Fused photos and single-shot photos live in **`filesDir/scans/`** (via `ImageStorage`), not in `cacheDir`, so the system cannot evict them while pages reference them. `cacheDir` is reserved for true temporaries (logs, thumbnails).
-- Cleanup: (a) on app start delete orphaned files in `cacheDir` matching `hdr_*` / `*.jpg` that no page references (leftovers of earlier versions and crashes); (b) when a page is deleted by the user, delete its original and thumbnail; (c) 合成好的图像永久保存在 `filesDir/scans/`，导出或关闭文档后绝不自动删除，始终等待用户手动删除。
+- Cleanup: (a) on app start delete orphaned files in `cacheDir` matching `hdr_*` / `*.jpg` that no page references (leftovers of earlier versions and crashes); (b) when a page is deleted, delete its original and thumbnail; (c) after a document is exported/closed, original images may be deleted unless the user chooses to keep them (policy to be confirmed in settings).
 - Settings screen: show app storage in two lines — "Photos (kept)" for `filesDir/scans` and "Temporary" for cacheDir + pending — with a "Clear temporary files" button that never touches pages still in use.
 - JPEG quality of the fused output stays 95 until a size/quality trade-off is measured; do not change it silently.
 
